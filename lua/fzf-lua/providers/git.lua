@@ -378,7 +378,7 @@ M.branches = function(opts)
   ---@type fzf-lua.config.GitBranches
   opts = config.normalize_opts(opts, "git.branches")
   if not opts then return end
-  if opts.fn_transform == nil then opts.fn_transform = highlight_branch_line end
+  -- if opts.fn_transform == nil then opts.fn_transform = highlight_branch_line end
   if opts.preview then
     local preview = path.git_cwd(opts.preview, opts)
     opts.preview = shell.stringify_cmd(function(items)
@@ -407,7 +407,7 @@ M.worktrees = function(opts)
   ---@type fzf-lua.config.GitWorktrees
   opts = config.normalize_opts(opts, "git.worktrees")
   if not opts then return end
-  if opts.fn_transform == nil then opts.fn_transform = highlight_worktree_line end
+  -- if opts.fn_transform == nil then opts.fn_transform = highlight_worktree_line end
   if opts.preview then
     local preview_cmd = opts.preview
     opts.preview = shell.stringify_cmd(function(items)
