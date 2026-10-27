@@ -216,7 +216,12 @@ M.buffers = function(opts)
   if not opts then return end
 
   local contents = function(cb)
-    local buflist = assert(utils.CTX().buflist)
+    -- `contents` can run asynchronously via fzf's `reload` action (#2736),
+    -- possibly after the picker was closed or its context was re-created
+    -- without `buflist` (e.g. another picker started). Request the buffer
+    -- list explicitly instead of relying on the context created when the
+    -- picker was opened.
+    local buflist = assert(utils.CTX({ includeBuflist = true }).buflist)
     local filtered, _, max_bufnr = filter_buffers(opts, buflist)
 
     if next(filtered) then
@@ -277,6 +282,7 @@ M.buffer_lines = function(opts)
 
     coroutine.wrap(function()
       local co = coroutine.running()
+      ---@cast co thread
 
       local buffers = filter_buffers(opts,
         opts.current_buffer_only and { utils.CTX().bufnr } or utils.CTX().buflist or {})
@@ -298,6 +304,7 @@ M.buffer_lines = function(opts)
         bnames[tostring(b)] = bname
       end
       local len_bufnames = math.min(tonumber(opts.show_bufname_len) or 15, longest_bname)
+      ---@cast len_bufnames integer
 
       for _, bufnr in ipairs(buffers) do
         local data = {}
@@ -537,6 +544,7 @@ M.treesitter = function(opts)
       local scope = "local" ---@type string
       ---@diagnostic disable-next-line: param-type-mismatch
       for k, v in pairs(metadata) do
+        ---@cast k string
         if k and vim.endswith(k, "local.scope") and type(v) == "string" then
           scope = v
         end
@@ -585,6 +593,7 @@ M.treesitter = function(opts)
   local contents = function(cb)
     coroutine.wrap(function()
       local co = coroutine.running()
+      ---@cast co thread
       for _, definition in ipairs(get(bufnr0)) do
         local nodes = get_local_nodes(definition)
         for _, node in ipairs(nodes) do
@@ -649,6 +658,7 @@ M.spellcheck = function(opts)
   local contents = function(cb)
     coroutine.wrap(function()
       local co = coroutine.running()
+      ---@cast co thread
       local data = {}
 
       -- Use vim.schedule to avoid

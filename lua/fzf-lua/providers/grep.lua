@@ -266,7 +266,7 @@ M.grep_cword = function(opts)
   opts = opts or {}
   opts.no_esc = true
   -- match whole words only (#968)
-  opts.search = [[\b]] .. utils.rg_escape(vim.fn.expand("<cword>")) .. [[\b]]
+  opts.search = utils.rg_escape_cword(vim.fn.expand("<cword>"))
   return M.grep(opts)
 end
 
@@ -323,7 +323,7 @@ M.grep_curbuf = function(opts, lgrep)
 
   -- Persist call options so we don't revert to global grep on `grep_lgrep`
   opts.__call_opts = vim.tbl_deep_extend("keep",
-    opts.__call_opts or {}, config.globals.grep_curbuf)
+    opts.__call_opts or {}, config.globals.grep_curbuf) --[[@as table]]
   opts.__call_opts.filename = opts.filename
 
   if lgrep then

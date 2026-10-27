@@ -22,6 +22,7 @@ end
 
 local function coroutine_callback(fn)
   local co = coroutine.running()
+  ---@cast co thread
   local callback = function(...)
     if coroutine.status(co) == "suspended" then
       coroutine.resume(co, ...)
@@ -65,8 +66,365 @@ M.uv_spawn = function(cmd, opts, on_exit)
       renv[#renv + 1] = string.format("%s=%s", k, tostring(v))
     end
     return renv
-  end)() ---@diagnostic disable-next-line: unnecessary-assert, return-type-mismatch
+  end)() ---@diagnostic disable-next-line: unnecessary-assert, return-type-mismatch, redundant-return-value
   return assert(uv.spawn(cmd, opts, on_exit))
+end
+
+-- The FFI table must be obtained via `require("ffi")`: it is cached in
+-- `package.loaded`, so all code shares a single CType state. Calling the
+-- library constructor directly (`package.preload.ffi()`) re-runs
+-- `luaopen_ffi`, which re-initializes the CType state: every previous
+-- `cdef` is dropped and already-resolved symbols start resolving to
+-- unrelated types (calling them fails with e.g. `'short' is not callable`).
+-- All Windows APIs used by this module are declared in a single `cdef`.
+local win_ffi = nil ---@type table|false|nil
+
+---@return { ffi: table, k32: table }?
+local function win_ffi_init()
+  if win_ffi ~= nil then return win_ffi or nil end
+  local ok, res = pcall(function()
+    local ffi = require("ffi")
+    ffi.cdef([[
+      typedef struct { short x; short y; } FzfCOORD;
+      typedef struct { short left; short top; short right; short bottom; } FzfSMALL;
+      typedef struct {
+        FzfCOORD dwSize;
+        FzfCOORD dwCursorPosition;
+        unsigned short wAttributes;
+        FzfSMALL srWindow;
+        FzfCOORD dwMaximumWindowSize;
+      } FzfCSBI;
+      void* CreateFileW(const unsigned short*, unsigned long,
+        unsigned long, void*, unsigned long, unsigned long, void*);
+      int CloseHandle(void* hObject);
+      int GetConsoleScreenBufferInfo(void* hConsoleOutput, FzfCSBI* info);
+      int _open_osfhandle(long long, int);
+      void* GetStdHandle(unsigned long nStdHandle);
+      int GetHandleInformation(void* hObject, unsigned long* lpdwFlags);
+      int SetHandleInformation(void* hObject, unsigned long dwMask,
+        unsigned long dwFlags);
+      typedef struct {
+        unsigned long nLength;
+        void* lpSecurityDescriptor;
+        int bInheritHandle;
+      } FzfSA;
+    ]])
+    return { ffi = ffi, k32 = ffi.load("kernel32") }
+  end)
+  win_ffi = (ok and res) or false
+  return win_ffi or nil
+end
+
+-- Reopen the Windows console (`CONIN$`/`CONOUT$`) as inheritable CRT fds.
+-- When the shell widgets capture both output streams (e.g. a PSReadLine key
+-- handler piping stdout and stderr), spawned children have no console handle
+-- left to inherit: nvim's TUI hangs without one and fzf silently ignores
+-- `--height` (the light renderer writes the UI to a console stderr and falls
+-- back to fullscreen without one). Returns `{ stdin, stdout, stderr }` fds,
+-- or nil when the console cannot be reopened (or on other platforms).
+M.win_console_stdio = function()
+  if not _is_win then return end
+  if M._win_console_fds ~= nil then return M._win_console_fds or nil end
+  local ok = pcall(function()
+    local win = win_ffi_init()
+    local ffi = assert(win and win.ffi)
+    local function wsz(s)
+      local b = ffi.new("unsigned short[?]", #s + 1)
+      for i = 1, #s do b[i - 1] = s:byte(i) end
+      return b
+    end
+    local sa = ffi.new("FzfSA")
+    sa.nLength = ffi.sizeof(sa)
+    sa.bInheritHandle = 1
+    -- The handles must allow *write* access, not just read: nvim's TUI
+    -- calls `SetConsoleMode` on stdin (needs `GENERIC_WRITE`) and hangs
+    -- before rendering anything if that fails.
+    local GENERIC_RW, SHARE_RW, OPEN_EXISTING = 0xC0000000, 3, 3
+    local hi = ffi.C.CreateFileW(wsz("CONIN$"), GENERIC_RW, SHARE_RW, sa, OPEN_EXISTING, 0, nil)
+    local ho = ffi.C.CreateFileW(wsz("CONOUT$"), GENERIC_RW, SHARE_RW, sa, OPEN_EXISTING, 0, nil)
+    local vi = tonumber(ffi.cast("intptr_t", hi))
+    local vo = tonumber(ffi.cast("intptr_t", ho))
+    if vi == -1 or vo == -1 then error("CreateFileW failed") end
+    local conin = ffi.C._open_osfhandle(ffi.cast("long long", hi), 0)
+    local conout = ffi.C._open_osfhandle(ffi.cast("long long", ho), 0)
+    if conin < 0 or conout < 0 then error("_open_osfhandle failed") end
+    M._win_console_fds = { conin, conout, conout } ---@type integer[]|false
+  end)
+  if not ok then M._win_console_fds = false end
+  return M._win_console_fds or nil
+end
+
+-- Returns the stderr fd to pass to `uv.spawn` so the child sees a console:
+-- fd 2 is reused when it already is a tty, otherwise `CONOUT$` is reopened
+-- (see `win_console_stdio`); falls back to fd 2 when neither is possible.
+-- Always 2 on non-Windows platforms.
+M.win_stderr_fd = function()
+  if not _is_win then return 2 end
+  local ok, tty = pcall(uv.guess_handle, 2)
+  if ok and tty == "tty" then return 2 end
+  local console = M.win_console_stdio()
+  return console and console[3] or 2
+end
+
+--- Width of the Windows console screen buffer (`srWindow`), `nil` when not
+--- attached to a console or on other platforms. The std handles cannot be
+--- trusted for this: the pwsh PSReadLine key handlers pipe both stdout and
+--- stderr (`uv.new_tty` fails on the pipes) and a ConPTY stdin tty reports
+--- no size, so the console device is opened directly (`CONOUT$`/`CONIN$`,
+--- same rationale as `win_console_stdio`).
+---@return integer?
+M.win_console_width = function()
+  if not _is_win then return nil end
+  local width
+  pcall(function()
+    local win = win_ffi_init()
+    local ffi = assert(win and win.ffi)
+    local function wsz(s)
+      local b = ffi.new("unsigned short[?]", #s + 1)
+      for i = 1, #s do b[i - 1] = s:byte(i) end
+      return b
+    end
+    local GENERIC_RW, SHARE_RW, OPEN_EXISTING = 0xC0000000, 3, 3
+    local info = ffi.new("FzfCSBI")
+    for _, dev in ipairs({ "CONOUT$", "CONIN$" }) do
+      local h = ffi.C.CreateFileW(wsz(dev), GENERIC_RW, SHARE_RW, nil, OPEN_EXISTING, 0, nil)
+      local hv = tonumber(ffi.cast("intptr_t", h))
+      if hv ~= -1 then
+        if ffi.C.GetConsoleScreenBufferInfo(h, info) ~= 0 then
+          local w = info.srWindow.right - info.srWindow.left + 1
+          if w > 0 then width = w end
+        end
+        ffi.C.CloseHandle(h)
+        if width then break end
+      end
+    end
+  end)
+  return width
+end
+
+--- libuv as bundled with Neovim (<= 1.52) spawns children with
+--- `CreateProcess(bInheritHandles=TRUE)` and no
+--- `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so *every* inheritable handle of
+--- this process leaks into the child even when it isn't part of `stdio`.
+--- When a shell integration captures the picker output (stdout/stderr are
+--- pipes), those pipes would end up in the spawned process tree; an nvim
+--- `--embed` server left running by `:detach` would then keep the pipes'
+--- write end open forever and the shell's pipeline reader would never see
+--- EOF (stuck shell/key handler).
+---
+--- Temporarily clears `HANDLE_FLAG_INHERIT` on the stdio fds (`0`, `1`,
+--- `2`) that are not referenced by `stdio`. Returns a function restoring
+--- the original flags; call it right after `uv.spawn` returns (the
+--- child's handle table is fixed at `CreateProcess` time).
+---@param stdio table stdio table as passed to `uv.spawn`
+---@return fun()|nil restore
+M.win_stdio_no_inherit = function(stdio)
+  if not _is_win then return end
+  local win = win_ffi_init()
+  if not win then return end
+  local ffi, k32 = win.ffi, win.k32
+  local in_use = {} ---@type table<integer, boolean>
+  for _, std in ipairs(stdio) do
+    if type(std) == "number" then
+      ---@cast std integer
+      in_use[std] = true
+    end
+  end
+  local HANDLE_FLAG_INHERIT = 1
+  -- STD_INPUT_HANDLE/STD_OUTPUT_HANDLE/STD_ERROR_HANDLE (fds 0/1/2)
+  local STD_HANDLES = { 0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4 }
+  local saved = {} ---@type { h: any, flags: integer }[]
+  for fd = 0, 2 do
+    if not in_use[fd] then
+      local h = k32.GetStdHandle(STD_HANDLES[fd + 1])
+      local flags = ffi.new("unsigned long[1]")
+      if k32.GetHandleInformation(h, flags) ~= 0
+          and k32.SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) ~= 0 then
+        saved[#saved + 1] = { h = h, flags = flags[0] }
+      end
+    end
+  end
+  if #saved == 0 then return end
+  return function()
+    for _, s in ipairs(saved) do
+      k32.SetHandleInformation(s.h, HANDLE_FLAG_INHERIT, s.flags)
+    end
+  end
+end
+
+---@class fzf-lua.WinSpawnSpec
+---@field bin string fzf executable (`fzf`/`sk` or full path)
+---@field args string[] raw fzf argv (`uv.spawn` prepends `bin` as argv[0])
+---@field item? string producer command (cmd syntax), piped into fzf stdin
+---@field outfile string fzf stdout is redirected to this file
+---@field env? table<string,any>
+---@field cwd? string
+---@field stdin? integer fzf stdin fd when there is no `item` (default 0)
+---@field stderr? integer fzf stderr fd (default `win_stderr_fd()`)
+
+-- Windows ("one route") fzf spawn for `fzf.raw_fzf`: no shell, no escaping.
+-- `uv.spawn` runs fzf with the raw argv (`_cli_segments`), stderr stays on
+-- the console/pty (fzf's light renderer requires a console, see
+-- `IsLightRendererSupported` in fzf's `src/tui/light_windows.go`), stdout is
+-- redirected to `spec.outfile` (replaces the `> outfile` shell redirect) and
+-- the optional `spec.item` producer is spawned via `cmd.exe /c` with its
+-- stdout pumped into fzf's stdin, every chunk forwarded as-is, immediately.
+-- This replaces the caret-escaped cmd.exe launcher, the `(item) | fzf` cmd
+-- pipeline and the >8191-char PowerShell fallback. Callers: `scripts/cli.lua`
+-- (CLI nvim) and `win_spawn.lua` (mediator for TUI terminal buffers).
+---@param spec fzf-lua.WinSpawnSpec
+---@param opts { on_exit: fun(rc: integer) } called once fzf and the producer
+---  tree exited (the `outfile` is flushed before that)
+---@return boolean ok false when fzf failed to spawn (on_exit(1) still called)
+M.win_spawn = function(spec, opts)
+  assert(_is_win, "win_spawn is Windows only")
+  -- pause the producer read when this many bytes are queued for fzf
+  local HIGH, LOW = 4 * 1024 * 1024, 1024 * 1024
+  local item = spec.item and #spec.item > 0 and spec.item or nil
+  local stderr_fd = spec.stderr or M.win_stderr_fd()
+  ---@type integer?
+  local out_fd = assert(uv.fs_open(spec.outfile, "w", 420))
+  local prod_out = item and assert(uv.new_pipe(false)) or nil
+  local fzf_in = item and assert(uv.new_pipe(false)) or nil
+  local fzf_handle, prod_handle, kill_handle, kill_null
+  local prod_pid
+  local fzf_done, prod_done, kill_done = false, item == nil, true
+  local fzf_rc, finished
+  local writes, pending, paused, eof = 0, 0, false, false
+
+  ---@param h uv.uv_pipe_t|uv.uv_process_t|nil
+  local function close_handle(h)
+    if h and not h:is_closing() then h:close() end
+  end
+
+  local function finish(rc)
+    if finished then return end
+    finished = true
+    close_handle(fzf_in)
+    close_handle(prod_out)
+    close_handle(kill_handle)
+    close_handle(kill_null)
+    close_handle(fzf_handle)
+    close_handle(prod_handle)
+    if out_fd then
+      uv.fs_close(out_fd)
+      out_fd = nil
+    end
+    opts.on_exit(rc)
+  end
+
+  local function maybe_finish()
+    if fzf_done and prod_done and kill_done then
+      finish(fzf_rc == nil and 1 or fzf_rc)
+    end
+  end
+
+  -- producer EOF: flush the pending writes, then close our end of fzf's
+  -- stdin so fzf sees EOF (`--select-1` and `reload` actions rely on it)
+  local function close_write_end()
+    if eof and writes == 0 and fzf_in and not fzf_in:is_closing() then
+      fzf_in:close()
+    end
+  end
+
+  -- byte pump: forward each chunk as-is, immediately, no processing
+  local function pump(err, data)
+    if err or data == nil then
+      eof = true
+      close_handle(prod_out)
+      close_write_end()
+      return
+    end
+    if not fzf_in or fzf_in:is_closing() then return end
+    local len = #data
+    writes, pending = writes + 1, pending + len
+    fzf_in:write(data, function(werr)
+      writes, pending = writes - 1, pending - len
+      -- after fzf exits the queued writes error (EPIPE/ECANCELED)
+      if not werr and fzf_in and not fzf_in:is_closing() then
+        if paused and pending < LOW and prod_out and not prod_out:is_closing() then
+          paused = false
+          prod_out:read_start(pump)
+        end
+        close_write_end()
+      end
+    end)
+    if not paused and pending > HIGH and prod_out and not prod_out:is_closing() then
+      paused = true
+      prod_out:read_stop()
+    end
+  end
+
+  -- fzf first: a spawn failure aborts before the producer is started
+  local ok, spawn_err = pcall(function()
+    fzf_handle = M.uv_spawn(spec.bin, {
+      cwd = spec.cwd,
+      args = spec.args,
+      stdio = { fzf_in or spec.stdin or 0, out_fd, stderr_fd },
+      env = spec.env,
+    }, function(rc, _)
+      fzf_done, fzf_rc = true, rc
+      close_handle(fzf_handle)
+      if prod_out and not prod_out:is_closing() then
+        prod_out:read_stop()
+      end
+      -- fzf exited while the producer may still be running (e.g. the user
+      -- aborted a `ping`-like producer): luv's `kill` is not a tree kill
+      -- on Windows, `taskkill /T /F` reaps the launcher and its children
+      if not prod_done and prod_pid then
+        kill_done = false
+        local kok = pcall(function()
+          if not kill_null then kill_null = assert(uv.new_pipe(false)) end
+          kill_handle = M.uv_spawn("taskkill.exe", {
+            args = { "/PID", tostring(prod_pid), "/T", "/F" },
+            stdio = { nil, kill_null, kill_null },
+          }, function()
+            kill_done = true
+            close_handle(kill_handle)
+            maybe_finish()
+          end)
+          close_handle(kill_null)
+          kill_null = nil
+        end)
+        if not kok then kill_done = true end
+      end
+      maybe_finish()
+    end)
+  end)
+  if not ok or not fzf_handle then
+    io.stderr:write(
+      ("[fzf-lua] failed to spawn '%s': %s\n"):format(spec.bin, tostring(spawn_err)))
+    finish(1)
+    return false
+  end
+
+  if item then
+    local pok = pcall(function()
+      prod_handle, prod_pid = M.uv_spawn("cmd.exe", {
+        -- pass the producer command verbatim: it is a raw `cmd /c` line,
+        -- libuv's quoting would corrupt it (same as the old launcher)
+        args = { "/d", "/e:off", "/f:off", "/v:off", "/c", item },
+        verbatim = true,
+        cwd = spec.cwd,
+        env = spec.env,
+        stdio = { nil, prod_out, stderr_fd },
+      }, function(_, _)
+        prod_done = true
+        close_handle(prod_handle)
+        maybe_finish()
+      end)
+    end)
+    if pok and prod_handle and prod_out then
+      prod_out:read_start(pump)
+    else
+      -- producer failed to spawn (e.g. malformed command): close the write
+      -- end so fzf still terminates (empty list, `shell_nop` semantics)
+      prod_done, eof = true, true
+      close_write_end()
+      maybe_finish()
+    end
+  end
+  return true
 end
 
 
@@ -109,6 +467,7 @@ M.spawn = function(opts, fn_transform, fn_done)
   local prev_line_content ---@type string?
   local handle, pid ---@type uv.uv_process_t, integer
   local co = coroutine.running()
+  ---@cast co thread
   local queue = require("fzf-lua.lib.queue").new()
   local work_ctx
 
@@ -188,6 +547,7 @@ M.spawn = function(opts, fn_transform, fn_done)
 
   local function write_cb(data)
     write_cb_count = write_cb_count + 1
+    ---@diagnostic disable-next-line: need-check-nil
     opts.cb_write(data, function(err)
       write_cb_count = write_cb_count - 1
       if err then
@@ -472,6 +832,7 @@ M.spawn_stdio = function(opts)
   end
 
   -- run the preprocessing fn
+  ---@diagnostic disable-next-line: call-non-callable
   if fn_preprocess then fn_preprocess(opts) end
 
   ---@type fzf-lua.content|fzf-lua.shell.data2?
@@ -500,7 +861,11 @@ M.spawn_stdio = function(opts)
     end
   end
 
-  local function exit(exit_code, msg)
+  -- Exit the fzf-lua spawn process; `vim.cmd.cquit` is typed `never` in
+  -- emmylua's stubs which makes `exit` itself uncallable from a `local
+  -- function` declaration, so wrap it as an annotated module-level alias.
+  ---@type fun(exit_code?: integer, msg?: string)
+  local exit = function(exit_code, msg)
     if msg then stderr_write(msg) end
     vim.cmd.cquit({ count = exit_code })
   end
@@ -549,10 +914,13 @@ M.spawn_stdio = function(opts)
     pipe_close(stderr)
     if vim.in_fast_event() then
       vim.schedule(function()
+        ---@diagnostic disable-next-line: call-non-callable
         if fn_postprocess then fn_postprocess(opts) end
+        ---@diagnostic disable-next-line: call-non-callable
         exit(code)
       end)
     else
+      ---@diagnostic disable-next-line: call-non-callable
       if fn_postprocess then fn_postprocess(opts) end
       exit(code)
     end
@@ -599,11 +967,15 @@ M.spawn_stdio = function(opts)
     cmd = content
   else
     local f = fn_transform or function(x) return x end
+    ---@diagnostic disable-next-line: call-non-callable, missing-parameter
     local w = function(s) if s then io.stdout:write(f(s) .. EOL) else on_finish(0) end end
+    ---@diagnostic disable-next-line: call-non-callable, missing-parameter, param-type-mismatch
     local wn = function(s) if s then return io.stdout:write(f(s)) else on_finish(0) end end
     if opts.is_live then ---@cast content fzf-lua.shell.data2
+      ---@diagnostic disable-next-line: param-type-mismatch, assign-type-mismatch
       local res = content(args(), opts)
-      if not res then return on_finish(0), nil end ---@cast res-?
+      if not res then return on_finish(0), nil end
+      ---@cast res fzf-lua.shell.data2
       content = res
     end
     if type(content) == "function" then content(w, wn) end
@@ -634,6 +1006,7 @@ M.spawn_stdio = function(opts)
       EOL = EOL,
     },
     fn_transform and function(x)
+      ---@diagnostic disable-next-line: call-non-callable
       return fn_transform(x, opts)
     end)
 end
@@ -670,7 +1043,9 @@ end
 -- this function is a better fit for utils but we're
 -- trying to avoid having any 'require' in this file
 ---@param s string
----@param win_style integer|string? 1=classic, 2=caret
+---@param win_style integer|string|boolean? force Windows escaping on posix:
+---  1 = classic CommandLineToArgvW backslash escape, 2 = caret escape with
+---  delayed expansion double-escape, `true`/nil (on Windows) = caret escape
 ---@return string
 M.shellescape = function(s, win_style)
   if _is_win or win_style then
@@ -794,6 +1169,198 @@ M.shellescape = function(s, win_style)
     vim.o.shell = shell
     return ret
   end
+end
+
+-- Parse a `cmd.exe` command line fragment into argv values, exactly as
+-- `cmd.exe` + the Win32 argv parser (Go runtime; fzf is a Go binary) would
+-- deliver them. User provided argument strings (`fzf_args`, `fzf_cli_args`,
+-- etc.) are written for the platform shell: on Windows they are cmd.exe
+-- fragments, typically pre-escaped with `shellescape` (caret style). The
+-- Windows direct spawn route (`libuv.win_spawn`) passes the raw argv to
+-- `uv.spawn` with no shell, so this reverses the parsing passes:
+--   1. `%NAME%` expansion (cmd.exe semantics; differs from batch scripts):
+--      a defined name (case-insensitive) expands to its value, which is
+--      not rescanned; an undefined name is left as text and the scan
+--      resumes one char later, so a later `%` may still pair (`%%TEMP%%`
+--      -> `%TEMP%`). A `shellescape`-escaped value carries a caret inside
+--      the scanned name (`^%NAME^%`), never matches and survives for the
+--      caret pass below. Not modelled: `%VAR:~x,y%` substitutions and
+--      cmd's pseudo vars (`%CD%` etc.); verified against `cmd.exe`
+--   2. cmd.exe caret consumption: `^X` -> `X` (and thus `^^` -> `^`); a
+--      caret is only special outside of double quotes, inside quotes it is
+--      literal and an unescaped `"` toggles the quoted state (this is what
+--      makes the `^"...^"` shellescape form safe: the escaped surrounding
+--      quotes are emitted literally and never enter the quoted state, so
+--      the inner caret escapes still apply)
+--   3. Win32 argv parsing as implemented by the Go runtime
+--      (`os/exec_windows.go`; fzf is a Go binary): quotes toggle and are
+--      dropped, a doubled `""` inside a quoted section is one literal quote
+--      ("Prior to 2008" rule; the pair is consumed and the quote state
+--      toggles once), backslash runs before quotes collapse (`2n` backslashes
+--      followed by a quote -> `n` backslashes + toggle quote mode, `2n+1` ->
+--      `n` backslashes + literal quote), unquoted whitespace splits args
+---@param s string cmd.exe command line fragment
+---@param env table<string,string>? variable environment (defaults to
+---  `vim.fn.environ()`, the environment `cmd.exe` would be spawned with)
+---@return string[] argv
+M.cmd_argv = function(s, env)
+  if not s or s == "" then return {} end
+  -- (1) expand defined `%NAME%` variables (`cmd.exe` performs this before
+  -- everything else; env lookups are case-insensitive on Windows)
+  env = env or vim.fn.environ()
+  local lookup = function(name)
+    if name == "" then return nil end
+    if env[name] ~= nil then return env[name] end
+    name = name:lower()
+    for k, v in pairs(env) do
+      if k:lower() == name then return v end
+    end
+    return nil
+  end
+  do
+    local out, i, slen = {}, 1, #s
+    while i <= slen do
+      if s:sub(i, i) == "%" then
+        local j = s:find("%", i + 1, true)
+        local val = j and lookup(s:sub(i + 1, j - 1)) or nil
+        if j and val then
+          out[#out + 1] = val
+          i = j + 1
+        elseif j then
+          -- undefined: leave this `%` for the next scan step (the closing
+          -- `%` can pair with a later one, as `cmd.exe` does with `%%X%%`)
+          out[#out + 1] = "%"
+          i = i + 1
+        else
+          out[#out + 1] = s:sub(i)
+          i = slen + 1
+        end
+      else
+        out[#out + 1] = s:sub(i, i)
+        i = i + 1
+      end
+    end
+    s = table.concat(out)
+  end
+  -- (2) consume cmd.exe caret escapes; a caret is only special outside of
+  -- double quotes. An unescaped `"` toggles the quoted state, while a caret
+  -- escaped `^"` is emitted literally and does not toggle it (the emitted
+  -- quote is re-interpreted by the argv pass below)
+  local parts = {}
+  local i, len = 1, #s
+  local quoted = false
+  while i <= len do
+    local c = s:sub(i, i)
+    if c == "^" and not quoted then
+      if i == len then break end -- dangling caret is dropped by cmd.exe
+      parts[#parts + 1] = s:sub(i + 1, i + 1)
+      i = i + 2
+    else
+      if c == [["]] then quoted = not quoted end
+      parts[#parts + 1] = c
+      i = i + 1
+    end
+  end
+  s = table.concat(parts)
+  -- (3) parse the unescaped command line into argv values
+  local argv = {}
+  local j = 1
+  len = #s
+  while j <= len do
+    local sp = s:sub(j, j)
+    if sp == " " or sp == "\t" then
+      j = j + 1
+    else
+      local buf, in_quotes = {}, false
+      while j <= len do
+        local c = s:sub(j, j)
+        if c == "\\" then
+          local k = j
+          while k <= len and s:sub(k, k) == "\\" do k = k + 1 end
+          local nback = k - j
+          if k <= len and s:sub(k, k) == '"' then
+            buf[#buf + 1] = string.rep("\\", math.floor(nback / 2))
+            if nback % 2 == 1 then
+              buf[#buf + 1] = '"'
+              j = k + 1
+            else
+              -- even run: emit backslashes, let the quote branch below apply
+              -- the doubling rule / toggle for the quote itself
+              j = k
+            end
+          else
+            buf[#buf + 1] = string.rep("\\", nback)
+            j = k
+          end
+        elseif c == '"' then
+          -- Go runtime `os/exec_windows.go`: a `""` inside a quoted section
+          -- is one literal quote ("Prior to 2008" rule); the pair is consumed
+          -- and the quote state toggles once (matches `fzf.exe` via `cmd.exe`)
+          if in_quotes and s:sub(j + 1, j + 1) == '"' then
+            buf[#buf + 1] = '"'
+            j = j + 2
+          else
+            j = j + 1
+          end
+          in_quotes = not in_quotes
+        elseif not in_quotes and (c == " " or c == "\t") then
+          break
+        else
+          buf[#buf + 1] = c
+          j = j + 1
+        end
+      end
+      argv[#argv + 1] = table.concat(buf)
+    end
+  end
+  return argv
+end
+
+---@class fzf-lua.CliSegment
+---@field text string    -- raw (unescaped) text
+---@field escape boolean -- true = escape this text for the target shell
+
+-- One argv element is a list of segments (usually 1; 2 for a fused "flag=value"
+-- or "--bind=<value>" string where the flag prefix is literal and the value is
+-- escaped). This lets a single final pass escape only the value segments,
+-- per target shell, without double-escaping literal flag text.
+---@alias fzf-lua.CliElement fzf-lua.CliSegment[]
+
+-- Escape a list of CLI elements for the given shell, re-fusing each element's
+-- segments into a single string. Both shells reuse `shellescape` (`cmd` uses
+-- the caret/win_style variant). Literal segments (`escape=false`) are emitted
+-- verbatim.
+---@param elements fzf-lua.CliElement[]
+---@param shell "posix"|"cmd"
+---@param win_style integer|string|boolean? forwarded to shellescape for "cmd"
+---@return string[]
+M.escape_cli = function(elements, shell, win_style)
+  local escapefn = function(s)
+    return M.shellescape(s, shell == "cmd" and win_style or nil)
+  end
+  local argv = {}
+  for _, elem in ipairs(elements) do
+    local buf = {}
+    for _, seg in ipairs(elem) do
+      table.insert(buf, seg.escape and escapefn(seg.text) or seg.text)
+    end
+    table.insert(argv, table.concat(buf))
+  end
+  return argv
+end
+
+-- Marker for `_fzf_cli_args` entries that carry a raw (unescaped) value
+-- alongside the escaped string form. `build_fzf_cli` consumes these to emit
+-- BOTH the legacy escaped string (for cmd/posix, byte-identical) and a raw
+-- CliElement segment list -- `fzf.raw_fzf` rebuilds the raw argv from the
+-- segments for the Windows direct spawn (`libuv.win_spawn`, no shell and no
+-- escaping; shares `fzf-tmux` and the CLI launcher equally). `prefix` is the
+-- literal, never-escaped flag text (e.g. "--bind=" or "--interactive --cmd ").
+---@param prefix string literal flag prefix (e.g. "--bind=")
+---@param value string raw (unescaped) value
+---@return table marker
+M.cli_raw_arg = function(prefix, value)
+  return { __raw_cli = true, prefix = prefix, value = value }
 end
 
 -- Windows fzf oddities, fzf's {q} will send escaped blackslahes,

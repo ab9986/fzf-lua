@@ -7,6 +7,7 @@ local utils = fzf.utils
 
 describe("Testing utils module", function()
   it("separator", function()
+    local is_windows = utils.__IS_WINDOWS
     utils.__IS_WINDOWS = false
     eq(utils._if_win_normalize_vars("--w=$COLUMNS"), "--w=$COLUMNS")
 
@@ -17,7 +18,8 @@ describe("Testing utils module", function()
     eq(utils._if_win_normalize_vars("--w=$COLUMNS", 2), "--w=!COLUMNS!")
     eq(utils._if_win_normalize_vars("--w=%COLUMNS%", 2), "--w=!COLUMNS!")
     eq(utils._if_win_normalize_vars("-w=$C -l=$L", 2), "-w=!C! -l=!L!")
-    utils.__IS_WINDOWS = nil
+    -- restore the module flag, other specs depend on it
+    utils.__IS_WINDOWS = is_windows
   end)
 
   it("version formatter", function()
@@ -80,6 +82,114 @@ describe("Testing utils module", function()
     eq(utils.has({ __FZF_VERSION = { 2, 5, 5 } }, "fzf", "2.5.4"), true)
     eq(utils.has({ __FZF_VERSION = { 2, 5, 5 } }, "fzf", "2.5.5"), true)
     eq(utils.has({ __FZF_VERSION = { 2, 5, 5 } }, "fzf", "2.5.6"), false)
+  end)
+
+  it("fzf_tty_get_width probe order (ConPTY stdout before stdin)", function()
+    helpers.SKIP_IF_NOT_WIN()
+    local libuv = require("fzf-lua.libuv")
+    local orig_console_width = libuv.win_console_width
+    local orig = {}
+    local sizes = {} ---@type table<integer, integer|false>
+    ---@return function restore
+    local function stub_new_tty()
+      ---@diagnostic disable-next-line: deprecated
+      local t = vim.uv or vim.loop
+      if t and not orig[t] then
+        orig[t] = t.new_tty
+        t.new_tty = function(fd, _)
+          if sizes[fd] == false then error("UV_ENOTTY", 0) end
+          return {
+            get_winsize = function() return sizes[fd] end,
+            close = function() end,
+          }
+        end
+      end
+      return function()
+        for tt, o in pairs(orig) do tt.new_tty = o end
+      end
+    end
+    local restore = stub_new_tty()
+    local ok, err = pcall(function()
+      -- stdin tty reports no size under ConPTY (psmux): stdout must win
+      sizes = { [1] = 226 }
+      eq(utils.fzf_tty_get_width(), 226)
+      -- stdout/stderr unusable, stdin is the console (previous behavior)
+      sizes = { [0] = 120 }
+      eq(utils.fzf_tty_get_width(), 120)
+      -- all std handles redirected (pwsh PSReadLine key handlers):
+      -- `uv.new_tty` fails on both pipes, the console device is queried
+      sizes = { [1] = false, [2] = false, [0] = false }
+      libuv.win_console_width = function() return 172 end
+      eq(utils.fzf_tty_get_width(), 172)
+      -- console unavailable: `$COLUMNS` is the last resort before o.columns
+      libuv.win_console_width = function() return nil end
+      local prev = vim.env.COLUMNS
+      vim.env.COLUMNS = "222"
+      eq(utils.fzf_tty_get_width(), 222)
+      vim.env.COLUMNS = prev
+    end)
+    libuv.win_console_width = orig_console_width
+    restore()
+    if not ok then error(err) end
+  end)
+
+  it("fzf_tty_get_width ioctl request per platform", function()
+    eq(utils._tty_ioctl_request("Linux"), 0x5413)
+    eq(utils._tty_ioctl_request("OSX"), 0x40087468)
+    eq(utils._tty_ioctl_request("BSD"), 0x40087468)
+    eq(utils._tty_ioctl_request("Windows"), nil)
+    eq(utils._tty_ioctl_request("POSIX"), nil)
+  end)
+
+  it("fzf_tty_get_width fallbacks", function()
+    local libuv = require("fzf-lua.libuv")
+    local orig_posix = utils._posix_tty_width
+    local orig_console = libuv.win_console_width
+    ---@diagnostic disable-next-line: deprecated
+    local tty = vim.uv or vim.loop
+    local orig_new_tty = tty.new_tty
+    if helpers.IS_WIN() then
+      -- force the std handle probes to fail so the stubs below are used
+      tty.new_tty = function() return nil end
+    end
+    local prev_columns = vim.env.COLUMNS
+    local ok, err = pcall(function()
+      -- a successful probe wins
+      utils._posix_tty_width = function() return 172 end
+      libuv.win_console_width = function() return 172 end
+      eq(utils.fzf_tty_get_width(), 172)
+      -- failed probes fall through to `$COLUMNS`
+      utils._posix_tty_width = function() return nil end
+      libuv.win_console_width = function() return nil end
+      vim.env.COLUMNS = "222"
+      eq(utils.fzf_tty_get_width(), 222)
+      -- then to `o.columns`
+      vim.env.COLUMNS = nil
+      eq(utils.fzf_tty_get_width(), vim.o.columns)
+    end)
+    utils._posix_tty_width = orig_posix
+    libuv.win_console_width = orig_console
+    tty.new_tty = orig_new_tty
+    vim.env.COLUMNS = prev_columns
+    if not ok then error(err) end
+  end)
+
+  it("fzf_tty_get_width without ffi (PUC Lua)", function()
+    helpers.SKIP_IF_WIN()
+    local saved_preload = package.preload.ffi
+    local saved_loaded = package.loaded.ffi
+    package.preload.ffi = nil
+    package.loaded.ffi = nil
+    local prev_columns = vim.env.COLUMNS
+    local ok, err = pcall(function()
+      vim.env.COLUMNS = "222"
+      -- must not raise and must fall through to `$COLUMNS`
+      eq(utils.fzf_tty_get_width(), 222)
+    end)
+    package.preload.ffi = saved_preload
+    package.loaded.ffi = saved_loaded
+    vim.env.COLUMNS = prev_columns
+    if not ok then error(err) end
   end)
 
   it("setmetatable with gc", function()
@@ -212,5 +322,116 @@ describe("Testing utils module", function()
     eq(utils.ctag_escape("^foo.bar$"), "^foo\\.bar$")
     -- escaped backslash before dot (\. becomes ., then rg_escape escapes both)
     eq(utils.ctag_escape("foo\\.bar"), "foo\\\\\\.bar")
+  end)
+
+  it("fs_stat_async", function()
+    -- stat an existing path
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local done, result = false, nil
+    utils.fs_stat_async(dir, 1000, function(stat)
+      done, result = true, stat
+    end)
+    eq(vim.wait(5000, function() return done end, 10), true)
+    eq(result and result.type, "directory")
+    vim.fn.delete(dir, "rf")
+
+    -- stat a non-existent path
+    local nonexistent = dir .. "-nonexistent"
+    done, result = false, "unexpected"
+    utils.fs_stat_async(nonexistent, 1000, function(stat)
+      done, result = true, stat
+    end)
+    eq(vim.wait(5000, function() return done end, 10), true)
+    eq(result, nil)
+  end)
+
+  it("file_is_readable_async", function()
+    -- readable file
+    local file = vim.fn.tempname()
+    local fd = io.open(file, "w")
+    eq(fd ~= nil, true)
+    if fd then
+      fd:write("test")
+      fd:close()
+    end
+    local done, result = false, nil
+    utils.file_is_readable_async(file, 1000, function(readable)
+      done, result = true, readable
+    end)
+    eq(vim.wait(5000, function() return done end, 10), true)
+    eq(result, true)
+    os.remove(file)
+
+    -- non-existent file
+    local nonexistent = vim.fn.tempname() .. "-nonexistent"
+    done, result = false, true
+    utils.file_is_readable_async(nonexistent, 1000, function(readable)
+      done, result = true, readable
+    end)
+    eq(vim.wait(5000, function() return done end, 10), true)
+    eq(result, false)
+  end)
+
+  it("fs_request_timeout times out", function()
+    helpers.SKIP_IF_WIN("requires mkfifo")
+    -- `fs_open` on a fifo with no writer blocks indefinitely (#908),
+    -- simulates a hung fs request on a stale mount (#2793)
+    local fifo = vim.fn.tempname()
+    vim.fn.system({ "mkfifo", fifo })
+    eq(vim.v.shell_error, 0)
+    local done, result = false, nil
+    utils.file_is_readable_async(fifo, 50, function(readable)
+      done, result = true, readable
+    end)
+    -- capture the results, unblock the stuck `fs_open` request (cancel
+    -- fails with EBUSY when the request is already executing on the
+    -- threadpool) and only then assert, so the cleanup always runs --
+    -- a request stuck on the threadpool hangs the test process at exit
+    local waited = vim.wait(5000, function() return done end, 10)
+    -- open as read-write so we don't block waiting for a peer
+    local f = io.open(fifo, "r+")
+    -- give the stuck request a chance to complete
+    vim.wait(200, function() return false end, 10)
+    if f then f:close() end
+    os.remove(fifo)
+    eq(waited, true)
+    eq(result, false)
+  end)
+
+  it("fs_stat_async times out", function()
+    helpers.SKIP_IF_WIN("requires mkfifo")
+    -- occupy the entire threadpool with blocking fifo opens so the
+    -- stat request stays queued and times out (#2793)
+    local fifo = vim.fn.tempname()
+    vim.fn.system({ "mkfifo", fifo })
+    eq(vim.v.shell_error, 0)
+    local open_cbs = 0
+    for _ = 1, 32 do
+      vim.uv.fs_open(fifo, "r", 438, function(_, fd)
+        open_cbs = open_cbs + 1
+        if fd then vim.uv.fs_close(fd) end
+      end)
+    end
+    local done = false
+    ---@type table?
+    local result
+    utils.fs_stat_async(fifo, 50, function(stat)
+      done, result = true, stat
+    end)
+    -- capture the results, unblock the stuck `fs_open` requests and only
+    -- then assert, so the cleanup always runs -- a request stuck on the
+    -- threadpool hangs the test process at exit
+    local waited = vim.wait(5000, function() return done end, 10)
+    -- keep the writer open until all requests complete or the queued
+    -- opens will block again once the writer is gone
+    local f = io.open(fifo, "r+")
+    local drained = vim.wait(5000, function() return open_cbs == 32 end, 10)
+    if f then f:close() end
+    os.remove(fifo)
+    eq(waited, true)
+    eq(result, nil)
+    eq(drained, true)
+    eq(open_cbs, 32)
   end)
 end)

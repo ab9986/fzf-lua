@@ -116,11 +116,13 @@ local FzfLua = require("fzf-lua")
 ---@field get fun(self: fzf-lua.PidObject): integer
 ---@field set fun(self: fzf-lua.PidObject, pid: integer?)
 
+---@alias fzf-lua.treesitter.lineParser (fun(line: string, lnum?: integer):string?,string?,string|table?,string?)
+
 ---a basic config can be used by fzf_exec?
 ---generated from the result of `:=FzfLua.config.normalize_opts({}, {})`
 ---@class fzf-lua.config.Base
 ---@field dir_icon? string
----@field enrich? fun(opts: fzf-lua.config.Resolved|{}):fzf-lua.config.Resolved|{}
+---@field enrich? fun(opts: fzf-lua.config.Resolved):fzf-lua.config.Resolved
 ---Path to fzf binary. By default uses fzf found in `$PATH`.
 ---@field fzf_bin? string
 ---Fzf `--color` flag configuration passed to the fzf binary, set `[1]=true` to inherit terminal colorscheme, consult `man fzf` for all available options.
@@ -192,7 +194,7 @@ local FzfLua = require("fzf-lua")
 ---@field render_crlf? boolean
 ---Custom path formatter, can be defined under `setup.formatters`, fzf-lua comes with a builtin vscode-like formatter, displaying the filename first followed by the folder. Try it out with `:FzfLua files formatter=path.filename_first` or `:FzfLua live_grep formatter=path.filename_first`. For permanency: `require("fzf-lua").setup({ files = { formatter = "path.filename_first" } })`.
 ---@field formatter? string
----@field _fzf_cli_args? string[]
+---@field _fzf_cli_args? (string|table)[]
 ---@field __INFO fzf-lua.Info
 ---@field __CTX fzf-lua.Ctx
 ---@field _normalized? boolean
@@ -203,7 +205,7 @@ local FzfLua = require("fzf-lua")
 ---@field _actions? fun():fzf-lua.config.Actions?
 ---@field __ACT_TO? function
 ---@field _start? boolean
----@field _treesitter? (fun(line: string):string?,string?,string|table?,string?)|boolean?
+---@field _treesitter? fzf-lua.treesitter.lineParser
 ---@field help_open_win? fun(buf: integer, enter: boolean, config: vim.api.keyset.win_config): integer
 ---Auto close fzf-lua interface when a terminal is opened, set to `false` to keep the interface open.
 ---@field autoclose? boolean
@@ -213,6 +215,17 @@ local FzfLua = require("fzf-lua")
 ---Pager command for shell preview commands (e.g. `delta`).
 ---@field preview_pager? string
 ---@field toggle_flag? string
+---@field reuse_win? boolean
+---@field no_action_set_cursor? boolean
+---@field no_action_zz? boolean
+---@field reverse_search? boolean
+---@field jump_using_norm? boolean
+---@field scope? string
+---@field fn_match_file? function
+---@field fn_match_commit_hash? function
+---@field register? string
+---@field remotes? string
+---@field separator? string
 ---@field _fzf_nth_devicons? boolean
 ---@field _headers? boolean
 
@@ -234,6 +247,7 @@ local FzfLua = require("fzf-lua")
 ---@field _contents? string
 ---@field _is_fzf_tmux? boolean
 ---@field __stringified? boolean
+---@field __action_fields? table<string, string[]>
 ---@field __stringify_cmd? boolean
 ---@field __sigwinches? string[]
 ---@field __sigwinch_cb table<string, function>
@@ -247,8 +261,17 @@ local FzfLua = require("fzf-lua")
 ---@field keymap fzf-lua.config.Keymap
 ---@field fzf_opts table<string, any>
 ---@field _resume_reload? boolean|function
----@field _fzf_cli_args string[]
+---@field _reload_fallback? boolean
+---@field _fzf_cli_args (string|table)[]
 ---@field _uri? boolean
+---@field is_loclist? boolean
+---@field last_query? string
+---@field cmd_add? string|string[]
+---@field cmd_del? string|string[]
+---@field ctags_file? string
+---@field _cmd? string|string[]
+---@field _is_loclist? boolean
+---@field _apply_awesome_theme? function
 
 ---GENERATED from `make gen`
 

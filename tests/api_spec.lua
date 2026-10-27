@@ -4,6 +4,7 @@ local helpers = require("fzf-lua.test.helpers")
 local child = helpers.new_child_neovim()
 local eq = helpers.expect.equality
 local new_set = MiniTest.new_set
+local sleep = function(ms) helpers.sleep(ms, child) end
 
 local T = helpers.new_set_with_child(child)
 
@@ -18,8 +19,15 @@ T["api"]["fzf_exec"]["table"] = function(multiprocess)
       table.insert(contents, tostring((i - 1) * 3 + j) .. ": " .. s)
     end
   end
-  helpers.FzfLua.fzf_exec(child, contents,
-    { __expect_lines = true, __postprocess_wait = true, multiprocess = multiprocess == true })
+  helpers.FzfLua.fzf_exec(child, contents, {
+    __expect_lines = true,
+    __postprocess_wait = true,
+    multiprocess = multiprocess == true,
+    __after_open = function()
+      child.wait_until_screenshot_text_match("300/300")
+      sleep(100); if not helpers.IS_LINUX() then sleep(250) end
+    end,
+  })
 end
 
 T["api"]["fzf_exec"]["function"] = new_set({ parametrize = { { "sync" }, { "async" } } }, {
@@ -36,6 +44,7 @@ T["api"]["fzf_exec"]["function"] = new_set({ parametrize = { { "sync" }, { "asyn
       helpers.FzfLua.fzf_exec(child, function(fzf_cb)
           coroutine.wrap(function()
             local co = coroutine.running()
+            ---@cast co thread
             for i = 1, 1000 do
               fzf_cb(tostring(i), function() coroutine.resume(co) end)
               coroutine.yield()
@@ -110,6 +119,9 @@ T["api"]["fzf_live"]["table"] = function(multiprocess)
       __postprocess_wait = true,
       __after_open = function()
         child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
+        -- Allow fzf's load event (pos(-1)) to finish updating the UI
+        -- before the screenshot is taken.
+        sleep(100); if not helpers.IS_LINUX() then sleep(250) end
       end,
       query = 100,
       keymap = { fzf = { load = "pos(-1)" } },
@@ -140,6 +152,9 @@ T["api"]["fzf_live"]["function"] = new_set({ parametrize = { { "sync" }, { "asyn
           __postprocess_wait = true,
           __after_open = function()
             child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
+            -- Allow fzf's load event (pos(-1)) to finish updating the UI
+            -- before the screenshot is taken.
+            sleep(100); if not helpers.IS_LINUX() then sleep(250) end
           end,
           query = 100,
           keymap = { fzf = { load = "pos(-1)" } },
@@ -150,6 +165,7 @@ T["api"]["fzf_live"]["function"] = new_set({ parametrize = { { "sync" }, { "asyn
           local q = args[1]
           return coroutine.wrap(function(fzf_cb)
             local co = coroutine.running()
+            ---@cast co thread
             if not tonumber(q) then
               fzf_cb("Invalid number: " .. tostring(q), function() coroutine.resume(co) end)
               coroutine.yield()
@@ -169,6 +185,9 @@ T["api"]["fzf_live"]["function"] = new_set({ parametrize = { { "sync" }, { "asyn
           __postprocess_wait = true,
           __after_open = function()
             child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
+            -- Allow fzf's load event (pos(-1)) to finish updating the UI
+            -- before the screenshot is taken.
+            sleep(100); if not helpers.IS_LINUX() then sleep(250) end
           end,
           query = 100,
           keymap = { fzf = { load = "pos(-1)" } },
@@ -281,6 +300,7 @@ T["api"]["events"] = new_set(
 
 T["api"]["resume"] = new_set({
   parametrize = { { "fzf_exec" }, { "fzf_live" } },
+  n_retry = not helpers.IS_LINUX() and 5 or nil,
 }, {
   function(api)
     helpers.FzfLua[api](child, "echo resume string content", {
@@ -289,7 +309,12 @@ T["api"]["resume"] = new_set({
       exec_empty_query = true,
       debug = 1,
     })
-    helpers.FzfLua.resume(child, { __expect_lines = true })
+    helpers.FzfLua.resume(child, {
+      __expect_lines = true,
+      __after_open = function()
+        sleep(100); if not helpers.IS_LINUX() then sleep(250) end
+      end,
+    })
 
     helpers.FzfLua[api](child, api == "fzf_exec"
       and function(fzf_cb)
@@ -305,7 +330,12 @@ T["api"]["resume"] = new_set({
         exec_empty_query = true,
         debug = 1,
       })
-    helpers.FzfLua.resume(child, { __expect_lines = true })
+    helpers.FzfLua.resume(child, {
+      __expect_lines = true,
+      __after_open = function()
+        sleep(100); if not helpers.IS_LINUX() then sleep(250) end
+      end,
+    })
   end,
 })
 

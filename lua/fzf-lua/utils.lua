@@ -22,15 +22,31 @@ M.__IS_WINDOWS = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
 -- `:help shellslash` (for more info see #1055)
 M.__WIN_HAS_SHELLSLASH = M.__IS_WINDOWS and vim.fn.exists("+shellslash") == 1
 
-function M.__FILE__() return debug.getinfo(2, "S").source end
+function M.__FILE__()
+  local info = debug.getinfo(2, "S")
+  ---@cast info {source: string}
+  return info.source
+end
 
-function M.__LINE__() return debug.getinfo(2, "l").currentline end
+function M.__LINE__()
+  local info = debug.getinfo(2, "l")
+  ---@cast info {currentline: integer}
+  return info.currentline
+end
 
-function M.__FNC__() return debug.getinfo(2, "n").name end
+function M.__FNC__()
+  local info = debug.getinfo(2, "n")
+  ---@cast info {name: string}
+  return info.name
+end
 
 -- current function ref, since `M.__FNCREF__` is itself a function
 -- we need to go backwards once in stack (i.e. "2")
-function M.__FNCREF__() return debug.getinfo(2, "f").func end
+function M.__FNCREF__()
+  local info = debug.getinfo(2, "f")
+  ---@cast info {func: function}
+  return info.func
+end
 
 -- calling function ref, go backwards in stack twice first
 -- out of `utils.__FNCREF2__`, second out of calling function
@@ -101,6 +117,69 @@ end
 
 M.shell_nop = function()
   return M._if_win("break", "true")
+end
+
+---Byte-escape control/high bytes for diagnostics (`<0D>` for `\r`, ...).
+---Pipe/server addresses never contain such bytes, so an escaped address in
+---a message proves invisible junk rather than an identical-looking string.
+---@param s string
+---@return string
+M.escape_invisible = function(s)
+  return (s:gsub("[%z\1-\31\127-\255]",
+    function(c) return ("<%02X>"):format(c:byte()) end))
+end
+
+---Parse a serverlist entry (`<cwd> <mem> <cpu><nbsp><address>`) back into
+---a dialable server address. Trims surrounding whitespace/CR (fzf output
+---carries `\r\n` on Windows) and, on Windows, repairs the `\\.\pipe\...`
+---prefix (the fzf/cmd round trip eats one leading backslash, yielding an
+---unusable address that looks identical in the UI).
+---@param e string?
+---@return string?
+M.serverlist_parse_entry = function(e)
+  if not e then return nil end
+  local addr = M.strip_ansi_coloring(e):match(M.nbsp .. "(.-)$")
+  addr = addr and addr:match("^%s*(.-)%s*$") or nil
+  if addr and M.__IS_WINDOWS and addr:match("^\\%.\\pipe") then
+    addr = "\\" .. addr
+  end
+  return addr
+end
+
+---Convert an `nvim__screenshot` dump into plain `\n`-separated rows. The
+---dump is a terminal script (`LINES,COLS` header, CR + cursor-motion row
+---separators) which does not render reliably in every preview terminal.
+---SGR colors are kept, all cursor motion, erasing and queries are removed.
+---Row padding is preserved as-is so rows keep their full width and fill
+---the preview pane (fzf clips, never wraps, over-wide rows).
+---@param screenshot string path to the dump file (rewritten in place)
+---@return boolean ok
+M.screenshot_to_plaintext = function(screenshot)
+  local fd = io.open(screenshot, "rb")
+  if not fd then return false end
+  local data = fd:read("*a")
+  fd:close()
+  if not data or #data == 0 then return false end
+  -- drop the "LINES,COLS" header line
+  data = data:gsub("^%d+,%d+\r?\n", "")
+  -- strip vt sequences except SGR colors (`...m`): cursor motion, erase,
+  -- modes, queries, charset selects, OSC
+  data = data:gsub("\27%[(%??[%d;]*)([A-Za-z])", function(mods, term)
+    if term == "m" then return "\27[" .. mods .. "m" end
+    return ""
+  end)
+  data = data:gsub("\27%([%dA-Z0]", "")
+  data = data:gsub("\27%][^\7\27]*\7", "")
+  data = data:gsub("\27%][^\7\27]*\27\\", "")
+  -- rows are CR-separated: normalize to LF (collapse CRLF first so no
+  -- doubling). Padding is kept so rows fill the preview width.
+  data = data:gsub("\r\n", "\n"):gsub("\r", "\n")
+  if #data == 0 then return false end
+  local out = io.open(screenshot, "wb")
+  if not out then return false end
+  out:write(data)
+  out:close()
+  return true
 end
 
 ---@param vars table
@@ -243,6 +322,17 @@ function M.rg_escape(str)
       -- don't end up escaping the backslash twice
       :gsub("\n", "\\n")
   return ret
+end
+
+--- Escape a word and wrap it in `\b` word boundaries (#968), but only on edges
+--- that are word characters: a `\b` next to a non-word char (e.g. a cword
+--- ending in `$`) can never match and would yield no results.
+--- @param word string
+--- @return string
+function M.rg_escape_cword(word)
+  local bl = word:match("^[%w_]") and [[\b]] or ""
+  local br = word:match("[%w_]$") and [[\b]] or ""
+  return bl .. M.rg_escape(word) .. br
 end
 
 ---@param str string
@@ -423,6 +513,67 @@ M.file_is_readable = function(filepath)
   return false
 end
 
+-- Runs an async libuv fs request (e.g. `uv.fs_stat`, `uv.fs_open`) with
+-- a timeout, when the request fails to complete within `timeout` ms an
+-- attempt is made to cancel it using `uv.cancel` and the callback is
+-- called with `err` set. Cancellation is best-effort, a request already
+-- hung on the threadpool (e.g. stale network mount) can't be cancelled
+-- mid-syscall, its callback is then ignored once (if) it fires (#2793).
+---@param fn function async libuv fs function (e.g. `uv.fs_stat`)
+---@param timeout integer timeout in milliseconds
+---@param cb fun(err?: string, ...: any) called with the request results
+---@param ... any request arguments (i.e. path, flags, mode)
+M.fs_request_timeout = function(fn, timeout, cb, ...)
+  local done = false
+  local timer = assert(uv.new_timer())
+  local finish = function(err, ...)
+    if done then return end
+    done = true
+    timer:stop()
+    timer:close()
+    cb(err, ...)
+  end
+  local argv = { n = select("#", ...), ... }
+  argv[argv.n + 1] = finish
+  local req = fn(unpack(argv, 1, argv.n + 1))
+  if not req then
+    -- failed to queue the request, keep the callback async
+    timer:start(0, 0, function() finish("ECANCELED: failed to queue fs request") end)
+    return
+  end
+  timer:start(timeout, 0, function()
+    -- NOTE: when cancel succeeds the fs callback is still invoked with
+    -- "ECANCELED", when it fails (already executing) the fs callback is
+    -- eventually invoked with the result, both are ignored via `done`
+    if uv.cancel then pcall(uv.cancel, req) end
+    finish("ECANCELED: fs request timed out")
+  end)
+end
+
+--- Async `uv.fs_stat` with a timeout, calls `cb(nil)` when the request
+--- fails or does not complete within `timeout` milliseconds (#2793).
+---@param path string
+---@param timeout integer timeout in milliseconds
+---@param cb fun(stat: table?)
+M.fs_stat_async = function(path, timeout, cb)
+  M.fs_request_timeout(uv.fs_stat, timeout, function(err, stat)
+    cb(not err and stat or nil)
+  end, path)
+end
+
+--- Async `file_is_readable` with a timeout, calls `cb(false)` when the
+--- request fails or does not complete within `timeout` ms (#2793).
+---@param path string
+---@param timeout integer timeout in milliseconds
+---@param cb fun(readable: boolean)
+M.file_is_readable_async = function(path, timeout, cb)
+  M.fs_request_timeout(uv.fs_open, timeout, function(_err, fd)
+    if not fd then return cb(false) end
+    uv.fs_close(fd, function() end)
+    cb(true)
+  end, path, "r", 438)
+end
+
 M.perl_file_is_binary = function(filepath)
   filepath = M.pcall_expand(filepath)
   if vim.fn.executable("perl") ~= 1 or
@@ -569,7 +720,8 @@ end
 
 function M.tbl_flatten(T)
   if vim.iter then
-    return vim.iter(T):flatten(math.huge):totable()
+    ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
+    return vim.iter(T --[[@as table]]):flatten(math.huge --[[@as integer]]):totable()
   else
     ---@diagnostic disable-next-line: deprecated
     return vim.tbl_flatten(T)
@@ -919,7 +1071,7 @@ function M.strip_ansi_coloring(str)
   -- NOTE: didn't work with grep's "^[[K"
   -- return str:gsub("%[[%d;]-m", "")
   -- https://stackoverflow.com/a/49209650/368691
-  return str:gsub("[\27\155][][()#;?%d]*[A-PRZcf-ntqry=><~]", "")
+  return str:gsub("[\27\155][%[%]][()#;?%d]*[A-PRZcf-ntqry=><~]", "")
 end
 
 function M.ansi_escseq_len(str)
@@ -1074,18 +1226,21 @@ function M.load_profiles(profiles, silent)
     if profile == "borderless_full" then profile = "borderless-full" end
     local fname = path.join({ vim.g.fzf_lua_directory, "profiles", profile .. ".lua" })
     local profile_opts = M.load_profile_fname(fname, nil, silent)
+    ---@cast profile_opts table?
     if type(profile_opts) == "table" then
+      ---@cast profile_opts table
       if profile_opts[1] then
         -- profile requires loading base profile(s)
         -- silent = 1, only warn if failed to load
         profile_opts = vim.tbl_deep_extend("keep",
-          profile_opts, M.load_profiles(profile_opts[1], 1))
+          profile_opts, M.load_profiles(profile_opts[1], 1)) --[[@as table]]
       end
+      ---@cast profile_opts table
       if type(profile_opts.fn_load) == "function" then
         profile_opts.fn_load()
         profile_opts.fn_load = nil
       end
-      ret = vim.tbl_deep_extend("force", ret, profile_opts)
+      ret = (vim.tbl_deep_extend("force", ret, profile_opts) --[[@as table]])
     end
   end
   return ret
@@ -1120,6 +1275,7 @@ function M.buffer_is_dirty(bufnr, warn, only_if_last_buffer)
   bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
   local info = bufnr and M.getbufinfo(bufnr)
   if info and info.changed ~= 0 then
+    ---@diagnostic disable-next-line: param-type-mismatch
     if only_if_last_buffer and 1 < #vim.fn.win_findbuf(bufnr) then
       return false
     end
@@ -1280,6 +1436,7 @@ function M.eventignore(func, scope)
   local ret = { pcall(func) }
   vim.o.eventignore = save_ei
   if not ret[1] then error(ret[2]) end
+  ---@diagnostic disable-next-line: redundant-return-value
   return select(2, unpack(ret))
 end
 
@@ -1418,6 +1575,7 @@ function M.input(prompt, default)
         res = input
       end)
   else
+    ---@diagnostic disable-next-line: param-type-mismatch
     ok, res = pcall(vim.fn.input, { prompt = prompt, default = default, cancelreturn = 3 })
     if res == 3 then
       ok, res = false, nil
@@ -1535,6 +1693,15 @@ function M.git_version()
   return tonumber(out:match("(%d+.%d+)."))
 end
 
+  ---@param binary string?
+  ---@return boolean? is universal ctags
+  ---@return number? version
+function M.ctags_is_universal(binary)
+  local out, rc = M.io_system({ binary or "ctags", "--version" })
+  if rc ~= 0 then return end
+  return out:match("Universal") ~= nil, tonumber(out:match("(%d+.%d+).")) 
+end
+
 function M.create_user_command_callback(provider, arg, altmap)
   ---@param o vim.api.keyset.create_user_command.command_args
   ---@return table
@@ -1574,7 +1741,7 @@ function M.create_user_command_callback(provider, arg, altmap)
 end
 
 -- setmetatable wrapper support `__gc`
----@generic T
+---@generic T : table
 ---@param t T
 ---@param mt table
 ---@return T
@@ -1587,20 +1754,68 @@ function M.setmetatable(t, mt)
   return setmetatable(t, mt)
 end
 
+local RPC_TIMEOUT = 200
+
 ---always ensure chan is closed on error
+---@param addr string
+---@param timeout integer? ms to wait before force-closing the channel, `nil` waits indefinitely
+---@param method string
+---@param ... any
+---@return boolean, string|any, ...any
+local function rpcexec(addr, timeout, method, ...)
+  ---@type boolean, any
+  local ok, chan = pcall(vim.fn.sockconnect, "pipe", addr, { rpc = true })
+  if not ok or chan == 0 then return false, "Invalid channel" end
+  ---@type uv.uv_timer_t?
+  local timer
+  local fired = false
+  if timeout then
+    local t = assert(vim.uv.new_timer())
+    timer = t
+    pcall(function()
+      require("ffi").cdef [[bool channel_close(unsigned long long id, int part, const char **error);]]
+    end)
+    t:start(timeout, 0, M.nil_wrap(function()
+      if not t:is_closing() then t:close() end
+      fired = true
+      require("ffi").C.channel_close(chan, 3, nil)
+    end))
+  end
+  ---@cast chan integer
+  local ret = { pcall(vim.rpcrequest, chan, method, ...) }
+  if timer and not timer:is_closing() then timer:close() end
+  if fired then return false, "Timeout" end
+  vim.fn.chanclose(chan)
+  local tonil = function(v) if v == vim.NIL then return nil else return v end end
+  ---@diagnostic disable-next-line: missing-return-value
+  return unpack(vim.tbl_map(tonil, ret))
+end
+
+---Blocking RPC: waits indefinitely for the peer to reply.
 ---@param addr string
 ---@param method string
 ---@param ... any
 ---@return boolean, string|any, ...any
 function M.rpcexec(addr, method, ...)
-  ---@type boolean, any
-  local ok, chan = pcall(vim.fn.sockconnect, "pipe", addr, { rpc = true })
-  if not ok or chan == 0 then return false, "Invalid channel" end
-  ---@cast chan integer
-  local ret = { pcall(vim.rpcrequest, chan, method, ...) }
-  vim.fn.chanclose(chan)
-  local tonil = function(v) if v == vim.NIL then return nil else return v end end
-  return unpack(vim.tbl_map(tonil, ret))
+  return rpcexec(addr, nil, method, ...)
+end
+
+---@param addr string
+---@param method string
+---@param ... any
+---@return boolean, string|any, ...any
+function M.rpcexec_timed(addr, method, ...)
+  return rpcexec(addr, RPC_TIMEOUT, method, ...)
+end
+
+---Timed server liveness probe: open a channel and query it. Nil-safe
+---(`chan_info` without an id counts as dead instead of raising).
+---@param addr string server address (pipe path or socket)
+---@return boolean alive, any detail (info table on success, error on failure)
+function M.server_probe(addr)
+  local ok, info = M.rpcexec_timed(addr, "nvim_get_chan_info", 0)
+  if ok and info and info.id ~= nil then return true, info end
+  return false, info or "no chan id"
 end
 
 --- Checks if treesitter parser for language is installed
@@ -1633,7 +1848,7 @@ function M.jump_to_location(location, offset_encoding, reuse_win)
         { reuse_win = reuse_win, focus = true })
     end)
   else
-    ---@diagnostic disable-next-line: deprecated
+    ---@diagnostic disable-next-line: deprecated, undefined-field
     return vim.lsp.util.jump_to_location(location, offset_encoding, reuse_win)
   end
 end
@@ -1655,6 +1870,106 @@ function M.termopen(cmd, opts)
     ---@diagnostic disable-next-line: deprecated
     return vim.fn.termopen(cmd, opts)
   end
+end
+
+--- `TIOCGWINSZ` is `_IOR('t', 104, struct winsize)`: 0x40087468 on
+--- macOS/BSD, 0x5413 on Linux. `nil` on other platforms (fallbacks used).
+---@param os string? `ffi.os`
+---@return integer?
+M._tty_ioctl_request = function(os)
+  if os == "Linux" then return 0x5413 end
+  if os == "OSX" or os == "BSD" then return 0x40087468 end
+end
+
+--- Terminal width via `ioctl(TIOCGWINSZ)` on fds 1, 2, 0, `nil` when
+--- unknown, on Windows, or when FFI is unavailable (PUC Lua builds).
+--- `uv.new_tty` is deliberately not used on POSIX: libuv reopens tty fds
+--- (setting `O_NONBLOCK` on the shared description) and accepts
+--- pipes/sockets, which `uv_close` would close - mutating the process's
+--- std handles. `ioctl` has no such side effects.
+---@return integer?
+M._posix_tty_width = function()
+  if M.__IS_WINDOWS then return nil end
+  local width
+  pcall(function()
+    local ffi = require("ffi")
+    if not M._tty_cdef_done then
+      M._tty_cdef_done = true
+      -- identical declaration to `profiles/cli.lua`, re-`cdef` is a no-op
+      pcall(function()
+        ---@diagnostic disable-next-line: call-non-callable
+        ffi.cdef [[
+          struct winsize {
+            unsigned short ws_row;
+            unsigned short ws_col;
+            unsigned short ws_xpixel;
+            unsigned short ws_ypixel;
+          };
+          int ioctl(int fd, unsigned long request, ...);
+        ]]
+      end)
+    end
+    local request = M._tty_ioctl_request(ffi.os)
+    if not request then return end
+    ---@diagnostic disable-next-line: assign-type-mismatch
+    local ws = ffi.new("struct winsize[1]") ---@type [{ ws_row: integer, ws_col: integer }]
+    for _, fd in ipairs({ 1, 2, 0 }) do
+      if ffi.C.ioctl(fd, request, ws) == 0 and ws[0].ws_col > 0 then
+        width = ws[0].ws_col
+        return
+      end
+    end
+  end)
+  return width
+end
+
+--- Width of the terminal the (headless) instance is attached to, `nil`
+--- when unknown. Used by the CLI (`_G.fzf_tty_get_width`, see
+--- `profiles/cli.lua`) so the flex preview layout compares against the
+--- real terminal width instead of `vim.o.columns` (80 in a UI-less
+--- process).
+---
+--- The std handles are probed in `1, 2, 0` order: on Windows/ConPTY
+--- (psmux, Windows Terminal) stdout/stderr resolve to the tty with the
+--- real size while a redirected stdin tty reports none
+--- (`uv.new_tty(0):get_winsize()` is nil). When every std handle is piped
+--- (pwsh PSReadLine key handlers) the console device is queried directly
+--- (`libuv.win_console_width`). POSIX probes the same fd order with
+--- `ioctl` (`_posix_tty_width`). `$COLUMNS` then `o.columns` are the final
+--- fallbacks on every platform.
+---@return integer? width
+M.fzf_tty_get_width = function()
+  local width
+  if M.__IS_WINDOWS then
+    for _, fd in ipairs({ 1, 2, 0 }) do
+      local ok, tty = pcall(uv.new_tty, fd, false)
+      if ok and tty then
+        local ok2, w = pcall(function() return tty:get_winsize() end)
+        pcall(function() tty:close() end)
+        if ok2 and type(w) == "number" and w > 0 then
+          width = w
+          break
+        end
+      end
+    end
+    if not width then
+      -- the pwsh PSReadLine key handlers pipe both stdout and stderr
+      -- (`uv.new_tty` fails on the pipes) and a ConPTY stdin tty reports
+      -- no size, leaving no std handle that can report the terminal size:
+      -- open the console device itself (same rationale as
+      -- `libuv.win_console_stdio`)
+      local w = require("fzf-lua.libuv").win_console_width()
+      if w and w > 0 then width = w end
+    end
+  else
+    -- `_posix_tty_width` returns nil when FFI is unavailable (PUC Lua)
+    width = M._posix_tty_width()
+  end
+  if width and width > 0 then return width end
+  local cols = tonumber(os.getenv("COLUMNS"))
+  if cols and cols > 0 then return math.floor(cols) end
+  if vim.o.columns and vim.o.columns > 0 then return vim.o.columns end
+  return nil
 end
 
 --- workaround to a potential 'tempname' bug? (#222)
@@ -1740,6 +2055,7 @@ function M.pid_object(key, opts)
 
   function Pid:set(pid) self.opts[self.key] = pid end
 
+  ---@diagnostic disable-next-line: return-type-mismatch
   return Pid:new(key, opts)
 end
 

@@ -53,7 +53,8 @@ local defaults = require("fzf-lua.defaults").defaults
 local res = vim.json.decode(obj.stdout or "") ---@type EmmyDocJson
 
 local tymap = {} ---@type table<string, EmmyDocType?>
-vim.iter(assert(res.types)):each(function(ty) tymap[ty.name] = ty end)
+---@diagnostic disable-next-line: redundant-parameter, call-non-callable, access-invisible
+vim.iter(assert(res.types) --[[@as table<integer, EmmyDocType>]]):each(function(ty) tymap[ty.name] = ty end)
 
 ---@param typ string
 ---@param default? string
@@ -71,7 +72,9 @@ local function fix_typ(typ, default)
   -- Remove outer parentheses from union types for cleaner display
   if typ:match("^%(.*%)$") then
     local ty = typ:sub(2, -2)
+    ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
     local is = vim.iter(vim.split(ty, ",")):all(function(t)
+    ---@diagnostic disable-next-line: return-type-mismatch
       return t:match([[".-"]])
     end)
     if is then
@@ -390,7 +393,9 @@ local function generate_globals()
 
   -- Then add Defaults type options
   local ty = assert(tymap["fzf-lua.config.Defaults"], "fzf-lua.config.Defaults type not found")
-  vim.iter(ty.members)
+  ---@diagnostic disable-next-line: redundant-parameter, call-non-callable, access-invisible
+  vim.iter(ty.members --[[@as table<integer, EmmyDocTypeMember>]])
+      ---@diagnostic disable-next-line: access-invisible
       :each(function(member)
         -- Skip excluded fields
         if EXCLUDE_FROM_GLOBALS[member.name] then

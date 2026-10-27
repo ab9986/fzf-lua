@@ -12,7 +12,7 @@ local _, H = debug.getupvalue(MiniTest.expect.reference_screenshot, 1)
 ---@class MiniTestScreenshot
 
 --- copied over from mini.test
----@param t { text?: string[], attr?: string[] }
+---@param t { text?: string[][], attr?: string[] }
 ---@param opts test.ScreenOpts?
 ---@return MiniTestScreenshot
 local function screenshot_new(t, opts)
@@ -47,11 +47,18 @@ end
 
 ---@param s string
 ---@return string[]
-local function string_to_chars(s)
+local function string_to_screenchars(s)
   -- Can't use `vim.split(s, '')` because of multibyte characters
   local res = {}
   for i = 1, vim.fn.strchars(s) do
-    table.insert(res, vim.fn.strcharpart(s, i - 1, 1))
+    local ch = vim.fn.strcharpart(s, i - 1, 1)
+    table.insert(res, ch)
+    -- Not single-width characters are read as a single char, but result into
+    -- `{ ch, '', ... }` when computing observed screenshot (as this is how
+    -- `vim.fn.screenstring()` works)
+    for _ = 1, vim.fn.strdisplaywidth(ch) - 1 do
+      table.insert(res, "")
+    end
   end
   return res
 end
@@ -66,10 +73,15 @@ function M.from_lines(text_lines, opts)
   if opts and opts.normalize_paths then
     text_lines = vim.tbl_map(function(x) return (x:gsub([[\]], [[/]])) end, text_lines)
   end
-  local f = function(x)
-    return string_to_chars(x)
+  if vim.fn.has("win32") == 1 then
+    -- Windows commands can emit CRLF (e.g. the `fd` listing) and a leaked
+    -- CR is rendered by fzf-lua as the `␍` glyph; replace both with a space
+    -- (keeping the cell alignment) so captures match the POSIX references
+    text_lines = vim.tbl_map(function(x)
+      return (x:gsub("\r", " "):gsub("␍", " "))
+    end, text_lines)
   end
-  return screenshot_new({ text = vim.tbl_map(f, text_lines) }, opts)
+  return screenshot_new({ text = vim.tbl_map(string_to_screenchars, text_lines) }, opts)
 end
 
 ---@param child MiniTest.child
@@ -79,7 +91,10 @@ end
 function M.fromChildBufLines(child, buf, opts)
   opts = opts or {}
   if opts and opts.redraw then child.cmd("redraw") end
-  local lines = child.api.nvim_buf_get_lines(buf or 0, opts.start_line and 0, opts.end_line + 1 or -1,
+  local lines = child.api.nvim_buf_get_lines(
+    buf or 0,
+    opts.start_line and 0,
+    opts.end_line and opts.end_line + 1 or -1,
     true)
   return M.from_lines(lines, opts)
 end
@@ -109,7 +124,7 @@ local screenshot_read = function(path)
   local lines = vim.fn.readfile(path)
   local text_lines = vim.list_slice(lines, 2, #lines)
 
-  local f = function(x) return H.string_to_chars(x:gsub("^%d+|", "")) end
+  local f = function(x) return string_to_screenchars(x:gsub("^%d+|", "")) end
   return screenshot_new({ text = vim.tbl_map(f, text_lines) }, opts)
 end
 
@@ -208,6 +223,36 @@ M.reference_screenshot = function(screenshot, path, opts)
   local context = string.format("%s\nReference:\n%s\n\nObserved:\n%s", cause, tostring(reference),
     tostring(screenshot))
   H.error_with_emphasis(subject, context)
+end
+
+--- Retry-friendly variant of the reference compare: `capture()` is called
+--- before every attempt so the child UI can settle (fzf/terminal grid updates
+--- are asynchronous and slow machines are prone to capturing partial renders).
+--- The reference file path is kept stable across attempts by restoring
+--- `n_screenshots` (its value defines the "-%03d" suffix).
+---@param compare fun(screenshot: MiniTestScreenshot, path?: string, opts?: table): boolean
+---@param capture fun(): MiniTestScreenshot
+---@param path? string
+---@param opts? table
+M.with_retry = function(compare, capture, path, opts)
+  opts = opts or {}
+  if opts.force then return compare(capture(), path, opts) end
+
+  -- Non-Linux environments are more prone to partial renders (and nested
+  -- process spawns like the `line_query` transform can take >10s on loaded
+  -- Windows machines before the preview renders)
+  local attempts = opts.retry_attempts or (vim.fn.has("linux") == 1 and 4 or 20)
+  local interval = opts.retry_interval or (vim.fn.has("linux") == 1 and 250 or 500)
+  local n_before = H.cache.n_screenshots
+  local last_err
+  for attempt = 1, attempts do
+    H.cache.n_screenshots = n_before
+    local ok, err = pcall(compare, capture(), path, opts)
+    if ok then return true end
+    last_err = err
+    if attempt < attempts then vim.uv.sleep(interval) end
+  end
+  error(last_err, 0)
 end
 
 -- modified version (no attr, trim trailing whitespace)

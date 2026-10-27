@@ -5,7 +5,9 @@ local path = require "fzf-lua.path"
 local libuv = require "fzf-lua.libuv"
 
 -- path to current file
-local __FILE__ = debug.getinfo(1, "S").source:gsub("^@", "")
+local _info = debug.getinfo(1, "S")
+---@cast _info {source: string}
+local __FILE__ = _info.source:gsub("^@", "")
 
 ---@class fzf-lua.lru
 ---@field max_size integer
@@ -283,6 +285,7 @@ end
 ---@param fzf_field_index string? Fzf field index expression, e.g. "{+}" (selected), "{q}" (query)
 ---@return string, integer?
 M.stringify = function(contents, opts, fzf_field_index)
+  ---@cast opts fzf-lua.config.Resolved
   -- TODO: should we let this assert?
   -- are there any conditions in which stringify is called subsequently?
   if opts.__stringified then ---@cast contents string
@@ -306,10 +309,13 @@ M.stringify = function(contents, opts, fzf_field_index)
     ---@type fzf-lua.content, table?
     ---@diagnostic disable-next-line: redefined-local, assign-type-mismatch
     local contents, env = (function()
+      ---@diagnostic disable-next-line: param-type-mismatch
       local ret = (opts.is_live and type(contents) == "function" and contents(unpack(args), opts))
+          ---@diagnostic disable-next-line: param-type-mismatch
           or (opts.__stringify_cmd and type(contents) == "function" and contents(unpack(args, 1, n)))
           or contents
       if opts.__stringify_cmd and type(ret) == "table" then
+        ---@diagnostic disable-next-line: undefined-field
         return ret.cmd, (ret.env or opts.env)
       else
         return ret, opts.env
@@ -322,6 +328,7 @@ M.stringify = function(contents, opts, fzf_field_index)
     local fn_preprocess = opts.fn_preprocess
     local fn_postprocess = opts.fn_postprocess
     local co = coroutine.running()
+    ---@cast co thread
 
     -- Run the preprocess function
     if type(fn_preprocess) == "function" then fn_preprocess(opts) end
@@ -355,6 +362,7 @@ M.stringify = function(contents, opts, fzf_field_index)
             -- safely remove items while iterating
             local i = 1
             while i <= #data do
+              ---@diagnostic disable-next-line: call-non-callable
               local v = fn_transform(data[i], opts)
               if not v then
                 table.remove(data, i)
@@ -448,7 +456,7 @@ end
 ---@alias fzf-lua.shell.cmdSpec string|{ cmd: string|string[], env: table? }?
 ---@alias fzf-lua.shell.cmd fun(items: string[], fzf_lines: integer, fzf_columns: integer, ctx?: fzf-lua.rpc.Ctx): fzf-lua.shell.cmdSpec
 ---@alias fzf-lua.shell.data fun(items: string[], fzf_lines: integer, fzf_columns: integer, ctx?: fzf-lua.rpc.Ctx): fzf-lua.content?
----@alias fzf-lua.shell.data2 fun(items: string[], opts: fzf-lua.config.Resolved|{}, ctx?: fzf-lua.rpc.Ctx): fzf-lua.content?
+---@alias fzf-lua.shell.data2 fun(items: string[], opts: fzf-lua.config.Resolved, ctx?: fzf-lua.rpc.Ctx): fzf-lua.content?
 
 ---@param fn fzf-lua.shell.cmd
 ---@param opts table
@@ -486,7 +494,7 @@ end
 -- Use both {q} and {+} as field indexes so we can update last query when
 -- executing the action, without this we lose the last query on "hide" as
 -- the process never terminates and `--print-query` isn't being printed
--- When no entry selected (with {q} {+}), {+} will be forced expand to ''
+-- When no entry selected (with {n} {+}), {+} will be forced expand to ''
 -- Use {n} to know if we really select an empty string, or there's just no selected
 ---@param fn fzf-lua.shell.data2
 ---@param opts table
@@ -494,22 +502,22 @@ end
 ---@return string
 M.stringify_data2 = function(fn, opts, field_index)
   local did_override = false
-  if not field_index:match("{q} {n}$") then
-    field_index = field_index .. " {q} {n}"
+  if not field_index:match("{n} {q}$") then
+    field_index = field_index .. " {n} {q}"
     did_override = true
   end
   -- replace the action with shell cmd proxy to the original action
   return (M.stringify_data(function(items, _, _)
-    local query, idx = items[#items - 1], items[#items]
+    local idx, query = items[#items - 1], items[#items]
     FzfLua.config.resume_set("query", query, opts)
     if did_override then
       table.remove(items)
       table.remove(items)
     end
-    -- fix side effect of "{q} {+}": {+} is forced expanded to ""
+    -- fix side effect of "{n} {+}": {+} is forced expanded to ""
     -- only when field_index is empty (otherwise it can be complex/unpredictable)
     -- {n} used to determine if "zero-selected && zero-match", then patch: "" -> nil
-    if field_index == "{+} {q} {n}" then
+    if field_index == "{+} {n} {q}" then
       -- When no item is matching (empty list or non-matching query)
       -- both {n} and {+} are expanded to "".
       -- NOTE1: older versions of fzf don't expand {n} to "" (without match)

@@ -123,13 +123,14 @@ function M.run(exec_lua, lvl, code, arg)
   -- Update upvalues
   if next(upvalues) then
     local caller = debug.getinfo(lvl)
+    ---@cast caller {func: function}
     local i = 0
 
     -- On PUC-Lua, if the function is a tail call, then func will be nil.
     -- In this case we need to use the caller.
     while not caller.func do
       i = i + 1
-      caller = debug.getinfo(lvl + i)
+      caller = debug.getinfo(lvl + i) --[[@as { func: function }]]
     end
     set_upvalues(caller.func, upvalues)
   end

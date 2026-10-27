@@ -56,9 +56,8 @@ end
 function M.resume_opts(opts)
   assert(opts.resume and opts.__call_opts)
   local __call_opts = M.resume_get(nil, opts)
-  opts = vim.tbl_deep_extend("keep", opts, __call_opts or {})
-  opts.__call_opts = vim.tbl_deep_extend("keep", opts.__call_opts, __call_opts or {})
-  -- _G.dump("__call_opts", opts.__call_opts)
+  opts = vim.tbl_deep_extend("keep", opts, __call_opts or {}) --[[@as { resume: boolean, __call_opts: table }]]
+  opts.__call_opts = vim.tbl_deep_extend("keep", opts.__call_opts, __call_opts or {}) --[[@as table]]
   return opts
 end
 
@@ -128,10 +127,11 @@ M.globals = setmetatable({}, {
         or (setup_value and (setup_value.actions or setup_value._actions)) then
       -- (2) the existence of the `actions` key implies we're dealing with a picker
       -- override global provider defaults supplied by the user's setup `defaults` table
-      ret = vim.tbl_deep_extend("force", ret, setup_defaults())
+      ret = (vim.tbl_deep_extend("force", ret, setup_defaults()) --[[@as fzf-lua.config.Defaults]])
     end
     -- (3) override with the specific provider options from the users's `setup` option
-    ret = vim.tbl_deep_extend("force", ret, utils.map_get(setup_opts(), index) or {})
+    ret = (vim.tbl_deep_extend("force", ret, utils.map_get(setup_opts(), index) or {})
+      --[[@as fzf-lua.config.Defaults]])
     return ret
   end,
   __newindex = function(_, index, _)
@@ -144,6 +144,7 @@ do
   -- used by M.globals.__index and M.defaults.<provider>._actions
   local m = require("fzf-lua.defaults")
   M.defaults = m.defaults
+  ---@diagnostic disable-next-line: inject-field
   m.globals = M.globals
 end
 
@@ -257,11 +258,16 @@ function M.normalize_opts(opts, globals, __resume_key) ---@diagnostic disable
 
   -- enforce fzf minimum requirements
   vim.g.fzf_lua_fzf_version = nil
-  if opts.fzf_bin:match("sk$") then
+  if vim.fs.basename(opts.fzf_bin):match("^sk") then
     local SK_VERSION, rc, err = utils.sk_version(opts)
     opts.__SK_VERSION = SK_VERSION
     if not opts.__SK_VERSION then
       utils.error("'sk --version' failed with error %s: %s", rc, err)
+      return nil
+    elseif utils.__IS_WINDOWS and not utils.has(opts, "sk", { 5, 8, 0 }) then
+      -- Windows minimum: older skim releases are unsupported on this platform
+      utils.error("skim version %s is lower than minimum (5.8.0) on Windows, aborting.",
+        utils.ver2str(opts.__SK_VERSION))
       return nil
     end
   else
@@ -963,6 +969,7 @@ function M.normalize_opts(opts, globals, __resume_key) ---@diagnostic disable
       and (opts.git_icons
         or opts.file_icons
         or opts.file_ignore_patterns
+        or opts.ignore_current_file
         or opts.strip_cwd_prefix
         or opts.render_crlf
         or opts.path_shorten
@@ -994,7 +1001,7 @@ function M.normalize_opts(opts, globals, __resume_key) ---@diagnostic disable
   end
 
   if opts.locate and utils.has(opts, "fzf", { 0, 36 }) then
-    table.insert(opts._fzf_cli_args, "--bind=" .. libuv.shellescape("load:+transform:"
+    table.insert(opts._fzf_cli_args, libuv.cli_raw_arg("--bind=", "load:+transform:"
       .. FzfLua.shell.stringify_data(function(_, _, _)
         if opts.__locate_pos then
           return string.format("pos(%d)", opts.__locate_pos)
@@ -1013,7 +1020,7 @@ function M.normalize_opts(opts, globals, __resume_key) ---@diagnostic disable
           return lnum, (subs > 0 and new_q or nil)
         end
     utils.map_set(opts, "winopts.preview.winopts.cursorline", true)
-    table.insert(opts._fzf_cli_args, "--bind=" .. libuv.shellescape("start,change:+transform:"
+    table.insert(opts._fzf_cli_args, libuv.cli_raw_arg("--bind=", "start,change:+transform:"
       .. FzfLua.shell.stringify_data(function(q, _, _)
         local lnum, new_q = opts.line_query(q[1])
         if not new_q then return end

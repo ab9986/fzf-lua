@@ -23,7 +23,7 @@ for _, v in vim.spairs(exported_modules) do
 end
 write("\n")
 for k, v in vim.spairs(lazyloaded_modules) do
-  write(([[FzfLua.%s = require(%q).%s]] .. "\n"):format(k, v[1], v[2]))
+  write(([[FzfLua.%s = require(%q).%s]] .. "\n"):format(k, v[1], v[2])) ---@diagnostic disable-line: undefined-field
 end
 write("\n")
 
@@ -40,20 +40,27 @@ local write_member = function(m)
   write("---@field " .. m.name .. " ")
   write(m.is_async and "async" or "")
   write("fun(")
-  local params = vim.iter(m.params)
+  ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
+  local params = vim.iter(m.params --[[@as table<integer, EmmyDocParam>]])
+  ---@diagnostic disable-next-line: access-invisible
   local p1 = params:next()
   if p1 then write(("%s: %s"):format(p1.name, p1.typ)) end
+  ---@diagnostic disable-next-line: access-invisible
   params:each(function(p) write((", %s: %s"):format(p.name, p.typ)) end)
   write(")")
 
-  local returns = vim.iter(m.returns)
+  ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
+  local returns = vim.iter(m.returns --[[@as table<integer, EmmyDocReturn>]])
+  ---@diagnostic disable-next-line: access-invisible
   local r1 = returns:next()
   if r1 then write((": " .. r1.typ)) end
+  ---@diagnostic disable-next-line: access-invisible
   returns:each(function(r) write(", " .. r.typ) end)
   write("\n")
 end
 
 write("---@class fzf-lua.win.api: fzf-lua.Win\n")
+---@diagnostic disable-next-line: redundant-parameter, call-non-callable, access-invisible
 vim.iter(res.members):each(write_member)
 
 flush()

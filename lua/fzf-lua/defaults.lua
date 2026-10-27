@@ -45,6 +45,10 @@ end
 -- Cross platform extended perl regex grep flag
 local GREP_PERL_REGEXP = utils.is_darwin() and "--extended-regexp" or "--perl-regexp"
 
+-- fzf runs bind commands through `cmd.exe` on Windows where environment
+-- variables use `%VAR%` instead of `$VAR`
+local FZF_POS = utils._if_win_normalize_vars("$FZF_POS")
+
 ---@class fzf-lua.config.TreesitterWinopts
 ---@field enabled boolean Enable treesitter highlighting in fzf main window.
 ---@field fzf_colors? table<string, string> Treesitter fzf color overrides.
@@ -120,7 +124,7 @@ local GREP_PERL_REGEXP = utils.is_darwin() and "--extended-regexp" or "--perl-re
 ---@field scrolloff? integer
 ---Debounce time (milliseconds) for displaying the preview buffer in the builtin previewer.
 ---@field delay? integer
----@field winopts fzf-lua.config.PreviewerWinopts Window options for the builtin previewer.
+---@field winopts? fzf-lua.config.PreviewerWinopts Window options for the builtin previewer.
 ---(skim only option), allow preview process run in pty
 ---@field pty? boolean
 
@@ -553,9 +557,11 @@ M.defaults.global = vim.tbl_deep_extend("force", M.defaults.files, {
   line_query        = true,
   pickers           = function()
     local clients = utils.lsp_get_clients({ bufnr = utils.CTX().bufnr })
+    ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
     local doc_sym_supported = vim.iter(clients):any(function(client)
       return client:supports_method("textDocument/documentSymbol")
     end)
+    ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
     local wks_sym_supported = vim.iter(clients):any(function(client)
       return client:supports_method("workspace/symbol")
     end)
@@ -676,10 +682,10 @@ M.defaults.git = {
   ---Git reference used as the base for the comparison.
   ---@field ref1? string
   diff = {
-    cmd               = "git --no-pager diff --name-only {ref1} {ref}",
+    cmd               = "git --no-pager diff --color=always --name-only {ref1} {ref}",
     ref               = nil,
     ref1              = nil,
-    preview           = "git diff {ref1} {ref} {file}",
+    preview           = "git diff --color=always {ref1} {ref} {file}",
     preview_pager     = M._preview_pager_fn,
     multiprocess      = 1, ---@type integer|boolean
     _type             = "file",
@@ -701,7 +707,7 @@ M.defaults.git = {
         header = "git hunks",
         reuse = #vim.api.nvim_list_uis() == 0,
         exec_silent = #vim.api.nvim_list_uis() > 0,
-        field_index = "{} $FZF_POS",
+        field_index = "{} " .. FZF_POS,
       },
       ["ctrl-q"] = {
         fn = function(s, _o)
@@ -710,7 +716,8 @@ M.defaults.git = {
           FzfLua.git_commits(o)
         end,
         reuse = true,
-        header = "git commits"
+        header = "git commits",
+        field_index = "{} " .. FZF_POS,
       },
     },
   },
@@ -771,7 +778,7 @@ M.defaults.git = {
         header = "git diff",
         reuse = #vim.api.nvim_list_uis() == 0,
         exec_silent = #vim.api.nvim_list_uis() > 0,
-        field_index = "{} $FZF_POS",
+        field_index = "{} " .. FZF_POS,
       },
     },
     fzf_opts      = { ["--no-multi"] = true },
@@ -780,9 +787,13 @@ M.defaults.git = {
   },
   ---Git commits (buffer).
   ---@class fzf-lua.config.GitBcommits: fzf-lua.config.GitBase
+  ---Follow the buffer's history across renames.
+  ---@field follow? boolean
   bcommits = {
     cmd           = [[git log --color --pretty=format:"%C(yellow)%h%Creset ]]
         .. [[%Cgreen(%><(12)%cr%><|(12))%Creset %s %C(blue)<%an>%Creset" -- {file}]],
+    -- When true, follow the buffer's history across renames.
+    follow        = false,
     preview       = "git show --color {1} -- {file}",
     preview_pager = M._preview_pager_fn,
     actions       = {
@@ -824,7 +835,7 @@ M.defaults.git = {
   ---@field cmd_del? string[]
   branches = {
     cmd        = [[git branch --all --color -vv ]]
-        .. [[--sort=-'committerdate' --sort='refname:rstrip=-2' --sort=-'HEAD']],
+        .. [[--sort=-committerdate --sort=refname:rstrip=-2 --sort=-HEAD]],
     preview    = "git log --graph --pretty=oneline --abbrev-commit --color {1}",
     remotes    = "local",
     actions    = {
@@ -1014,6 +1025,11 @@ M.defaults.args = {
 ---@field shada_file? string
 ---Only include files that still exist on disk.
 ---@field stat_file? boolean
+---Timeout in ms for the per-file stat checks, files whose stat does not
+---complete within the timeout are skipped, protects against hangs caused
+---by `fs_stat` on stale network mounts, broken links, etc. Set to `0` to
+---disable and use blocking stat calls. Requires `stat_file`.
+---@field stat_timeout? integer
 ---Include files opened during the current session.
 ---@field include_current_session? boolean
 ---Exclude the current buffer from the list.
@@ -1024,6 +1040,7 @@ M.defaults.oldfiles = {
   color_icons             = true,
   git_icons               = false,
   stat_file               = true,
+  stat_timeout            = 100,
   include_current_session = false,
   ignore_current_buffer   = true,
   fzf_opts                = { ["--tiebreak"] = "index", ["--multi"] = true },
@@ -1383,7 +1400,7 @@ M.defaults.tags = {
   -- field_index_expr = "{}", -- For `_fmt.from` to work with `bat_native`
   _actions      = function() return M.globals.actions.files end,
   actions       = { ["ctrl-g"] = { actions.grep_lgrep } },
-  _treesitter   = function(line) return ctag_line_parser(line, true) end,
+  _treesitter   = function(line, _) return ctag_line_parser(line, true) end,
 }
 
 ---Search current buffer ctags.
@@ -1557,8 +1574,8 @@ M.defaults.lsp = {
 ---@field symbol_hl? fun(s:string):string
 ---Custom format function for symbol display.
 ---@field symbol_fmt? fun(s:string, ...):string
----Display style for symbol icons, `1` for icon only, `2` for icon+name, `3` for icon+name(colored).
----@field symbol_style? integer
+---Display style for symbol kinds, `1` for icon+kind, `2` for icon only, `3` for kind only.
+---@field symbol_style? integer|false
 ---Icons for each symbol kind.
 ---@field symbol_icons? table<string, string>
 ---Display child prefix (indentation) for nested symbols.
@@ -1646,7 +1663,7 @@ M.defaults.lsp.document_symbols = vim.tbl_deep_extend("force", {}, M.defaults.ls
   git_icons   = false,
   file_icons  = false, ---@type integer|boolean
   fzf_opts    = {
-    ["--tiebreak"]  = "begin",
+    ["--tiebreak"]  = "end",
     ["--multi"]     = true,
     ["--tabstop"]   = "4",
     ["--delimiter"] = "[:]",
@@ -1737,14 +1754,17 @@ M.defaults.lsp.finder = {
 ---@field _ui_select? { kind: string }
 ---@field _items any[]
 M.defaults.lsp.code_actions = {
-  async_or_timeout = 5000,
-  previewer        = "codeaction",
   -- previewer        = "codeaction_native",
-  fzf_opts         = { ["--no-multi"] = true },
-  -- NOTE: we don't need an action as code actions are executed by the ui.select
-  -- callback but we setup an empty table to indicate to `globals.__index` that
-  -- we need to inherit from the global defaults (#1232)
-  actions          = {},
+  previewer = "codeaction",
+  fzf_opts  = { ["--no-multi"] = true },
+  actions   = {
+    ["enter"] = {
+      fn = function(...)
+        return require("fzf-lua.providers.ui_select").accept_item(...)
+      end,
+      desc = "accept-item"
+    }
+  }
 }
 
 ---Workspace/document diagnostics.
@@ -1917,9 +1937,12 @@ M.defaults.autocmds = {
 ---@field __locate_pos? integer
 ---Jump to the current undo position on picker open.
 ---@field locate boolean
+---Undo tree draw style, `tree` for the existing box-drawing layout or `graph` for the `:Undotree` ASCII graph layout.
+---@field tree_style "tree"|"graph"
 M.defaults.undotree = {
   previewer      = "undotree",
   locate         = true,
+  tree_style     = "tree",
   fzf_opts       = { ["--no-multi"] = true },
   actions        = { ["enter"] = actions.undo },
   _cached_hls    = { "buf_linenr", "buf_name", "path_linenr", "dir_part" },
@@ -2203,6 +2226,22 @@ M.defaults.zoxide = {
 M.defaults.complete_line = vim.tbl_deep_extend("force", M.defaults.blines, {
   complete = true,
 })
+
+
+---@class fzf-lua.config.UISelect: fzf-lua.config.Base
+M.defaults.ui_select = {
+  fzf_opts = { ["--no-multi"] = true },
+  ui_select = { preview_type = "native" },
+  actions = {
+    ["enter"] = {
+      fn = function(...)
+        return require("fzf-lua.providers.ui_select").accept_item(...)
+      end,
+      desc = "accept-item"
+    }
+  }
+}
+
 
 M.defaults.file_icon_padding = ""
 

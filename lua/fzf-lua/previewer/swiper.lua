@@ -49,7 +49,7 @@ function M.base:setup_opts(opts)
   opts.winopts.preview.horizontal = "right:0%"
   opts.fzf_opts["--preview-window"] = "nohidden:right:0"
   opts.preview = self:preview_cmd()
-  table.insert(opts._fzf_cli_args, "--bind=" .. libuv.shellescape("result:+" .. self:result_cmd()))
+  table.insert(opts._fzf_cli_args, libuv.cli_raw_arg("--bind=", "result:+" .. self:result_cmd()))
   -- NOTE: I don't feel we need the zero event, we just leave the cursor where it's at instead
   -- if utils.has(opts, "fzf", { 0, 40 }) then
   --   table.insert(opts._fzf_cli_args, "--bind=" .. libuv.shellescape("zero:+" .. self:zero_cmd()))
@@ -101,7 +101,7 @@ end
 function M.base:preview_cmd()
   return shell.stringify_data(function(items, _, _)
     ---@type string?, string?, string?
-    local entry, _, idx = unpack(items, 1, 3)
+    local entry, idx, _ = unpack(items, 1, 3)
     if not entry or not tonumber(idx) then return end
     local lnum, col = self:parse_lnum_col(entry, true)
     if not lnum or lnum < 1 then return end
@@ -113,7 +113,7 @@ function M.base:preview_cmd()
       vim.hl.range(self.ctx_bufnr, self.ns, self.opts.hls.cursor,
         { lnum - 1, col - 1 }, { lnum - 1, col }, {})
     end
-  end, self.opts, "{} {q} {n}")
+  end, self.opts, "{} {n} {q}")
 end
 
 function M.base:result_cmd()
@@ -145,16 +145,14 @@ function M.base:highlight_matches()
   if not vim.api.nvim_win_is_valid(fzf_win) or not vim.api.nvim_buf_is_valid(fzf_buf) then
     return
   end
-  local height = vim.api.nvim_win_get_height(fzf_win)
-  local off = vim.o.cmdheight + (vim.o.laststatus and 1 or 0)
-  local lines = vim.o.lines
-  local l_s = lines - height - off + 1
-  local l_e = lines - off - 1
+  local top = vim.fn.line("w0", fzf_win)
+  local bot = vim.fn.line("w$", fzf_win)
+  local top_row = vim.fn.screenpos(fzf_win, top, 1).row
   local max_columns = vim.o.columns
   local buf_lines = vim.api.nvim_buf_get_lines(fzf_buf, 0, -1, false)
-  for r = l_s, l_e do
+  for buf_lnum = top, bot do
     (function()
-      local buf_lnum = r - l_s + 2
+      local r = top_row + (buf_lnum - top)
       local lnum, _, col_valid_idx, col_off = self:parse_lnum_col(assert(buf_lines[buf_lnum]))
       if not lnum or lnum < 1 then return end
       local state = { bytelen = 0 }

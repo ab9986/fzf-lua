@@ -13,6 +13,7 @@ local M = {}
 M.metatable = function(opts)
   if not opts then return end
 
+  ---@diagnostic disable-next-line: inject-field
   if not opts.metatable then opts.metatable = getmetatable("").__index end
 
   local methods = {}
@@ -66,6 +67,7 @@ M.profiles = function(opts)
   local contents = function(cb)
     coroutine.wrap(function()
       local co = coroutine.running()
+      ---@cast co thread
 
       for _, d in ipairs(dirs) do
         ls(d, function(fname, name, type)
@@ -201,6 +203,7 @@ M.global = function(opts)
       -- Instantiate the previewer, opts isn't guaranteed if the picker
       -- isn't avilable, e.g. `tags` when not tags file exists
       if def.opts and def.opts.previewer then
+        ---@diagnostic disable-next-line: inject-field
         def.previewer = require("fzf-lua.previewer").new(def.opts.previewer, def.opts)
       end
     else
@@ -275,11 +278,11 @@ M.global = function(opts)
 
   opts._fzf_cli_args = opts._fzf_cli_args or {}
   -- Insert at the start of the args table so `line_query` callback is first
-  table.insert(opts._fzf_cli_args, 1, "--bind="
-    .. libuv.shellescape("start:+transform:" .. transform_picker(true)))
+  table.insert(opts._fzf_cli_args, 1,
+    libuv.cli_raw_arg("--bind=", "start:+transform:" .. transform_picker(true)))
 
-  table.insert(opts._fzf_cli_args, 2, "--bind="
-    .. libuv.shellescape("change:+transform:" .. transform_picker(false)))
+  table.insert(opts._fzf_cli_args, 2,
+    libuv.cli_raw_arg("--bind=", "change:+transform:" .. transform_picker(false)))
 
   if opts.header ~= false then
     local header = {}

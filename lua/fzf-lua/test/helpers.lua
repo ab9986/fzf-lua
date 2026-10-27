@@ -1,11 +1,34 @@
 ---@diagnostic disable: inject-field
 -- lcd so we can run current file even if cwd isn't fzf-lua
-local __FILE__ = debug.getinfo(1, "S").source:gsub("^@", "")
+local _info = debug.getinfo(1, "S")
+---@cast _info {source: string}
+local __FILE__ = _info.source:gsub("^@", "")
 vim.cmd.lcd(vim.fn.fnamemodify(__FILE__, ":p:h:h:h:h"))
 
 local MiniTest = require("mini.test")
 local screenshot = require("fzf-lua.test.screenshot")
 
+---@class fzf-lua.test.helpers
+---@field IS_WIN fun(): boolean
+---@field IS_NOT_WIN fun(): boolean
+---@field SKIP_IF_WIN fun(msg?: string): nil
+---@field SKIP_IF_NOT_WIN fun(msg?: string): nil
+---@field IS_LINUX fun(): boolean
+---@field IS_NOT_LINUX fun(): boolean
+---@field SKIP_IF_LINUX fun(msg?: string): nil
+---@field SKIP_IF_NOT_LINUX fun(msg?: string): nil
+---@field IS_MAC fun(): boolean
+---@field IS_NOT_MAC fun(): boolean
+---@field SKIP_IF_MAC fun(msg?: string): nil
+---@field SKIP_IF_NOT_MAC fun(msg?: string): nil
+---@field IS_STABLE fun(): boolean
+---@field IS_NOT_STABLE fun(): boolean
+---@field SKIP_IF_STABLE fun(msg?: string): nil
+---@field SKIP_IF_NOT_STABLE fun(msg?: string): nil
+---@field IS_NIGHTLY fun(): boolean
+---@field IS_NOT_NIGHTLY fun(): boolean
+---@field SKIP_IF_NIGHTLY fun(msg?: string): nil
+---@field SKIP_IF_NOT_NIGHTLY fun(msg?: string): nil
 local M = {}
 
 -- Busted like expectations
@@ -36,7 +59,7 @@ local os_detect = {
   },
   MAC = { name = "MacOS", fn = function() return vim.fn.has("mac") == 1 end },
   LINUX = { name = "Linux", fn = function() return vim.fn.has("linux") == 1 end },
-  STABLE = { name = "Neovim stable", fn = function() return M.NVIM_VERSION() == "0.12.2" end },
+  STABLE = { name = "Neovim stable", fn = function() return M.NVIM_VERSION() == "0.12.4" end },
   NIGHTLY = { name = "Neovim nightly", fn = function() return vim.fn.has("nvim-0.13") == 1 end },
 }
 
@@ -47,6 +70,7 @@ for k, v in pairs(os_detect) do
     if M[var] == nil then ---@diagnostic disable-next-line: assign-type-mismatch
       M[var] = v.fn()
     end
+    ---@diagnostic disable-next-line: undefined-field
     return M[var]
   end
   M["IS_NOT_" .. k] = function()
@@ -120,6 +144,9 @@ M.new_child_neovim = function()
   end
 
   child.init = function()
+    -- `child.stop` raises when the old job survives `jobstop`; that must
+    -- abort `restart` before mini.test's `start`, which no-ops while a job
+    -- is running and would silently run this case against the stale child
     child.restart({ "-u", "scripts/minimal_init.lua" })
     child.cmd("cd deps/fzf-lua")
 
@@ -152,6 +179,19 @@ M.new_child_neovim = function()
     -- using "FZF_DEFAULT_OPTS" hangs the command on the
     -- child process and the loading indicator never stops
     local defaults = { fzf_opts = { ["--gutter"] = " " } }
+    -- Windows: $FZF_DEFAULT_COMMAND is only honored when fzf's stdin is a tty
+    -- (`FZF_DEFAULT_COMMAND - Default command to use when input is tty`, see
+    -- src/util/util_windows.go Executor with `/s/c`). Inside mini.test child
+    -- processes (headless nvim started via jobstart without pty, nested
+    -- termopen pty on Windows) fzf's IsTty() is false, so it ignores the env
+    -- and blocks waiting for stdin EOF that never arrives: the headless
+    -- `nvim -l spawn.lua` never even starts (no spawn log/marker), fzf shows
+    -- `0/0` with loading spinner forever, `load` never fires and `wait_until`
+    -- timeout+retries (5x on Windows) make the suite appear hung. Piping via
+    -- `cmd.exe /c "(cmd) | fzf"` uses a stdin pipe (which closes) and works
+    -- regardless of tty detection, so default to pipe for headless (tests, cli)
+    -- on Windows. GUI sessions keep env (fzf kills its own default command on
+    -- exit; `pipe_cmd` routes the command through the `win_spawn` item pump).
     if M.IS_WIN() then defaults.pipe_cmd = true end
     child.lua(function(...)
       require("fzf-lua").setup(vim.tbl_deep_extend("keep", ..., {
@@ -178,6 +218,46 @@ M.new_child_neovim = function()
           end, {}))
       }))
     end, { config or {} })
+  end
+
+  --- Override `child.stop` (mini.test): avoid `rpcrequest`-ing `0cquit` to a
+  --- process that exits mid-request. On Windows this can hang indefinitely
+  --- (peer exits before the response, named pipe close not always detected).
+  --- Use `rpcnotify` (fire-and-forget) and terminate if it doesn't exit.
+  child.stop = function()
+    local job = child.job ---@type table|nil
+    if not job then return end
+    local job_id = job.id ---@type integer
+    local job_channel = job.channel ---@type integer
+    local job_address = job.address ---@type string
+
+    pcall(child.api_notify.nvim_command, "silent! 0cquit")
+    if vim.fn.jobwait({ job_id }, 1000)[1] == -1 then
+      pcall(vim.fn.jobstop, job_id)
+      if vim.fn.jobwait({ job_id }, 1000)[1] == -1 then
+        -- still running after jobstop: keep `child.job` so a later `stop` can
+        -- retry instead of deleting the address of a live process, and raise
+        -- so `restart`/`init` abort instead of `start` silently no-oping
+        -- (`is_running()`) and running the next case against the stale child.
+        -- `vim.notify` keeps it visible to callers that `pcall(child.stop)`
+        -- (post_once)
+        local msg = string.format(
+          "child.stop: job %d still alive after `jobstop`, kept for a retry",
+          job_id)
+        vim.notify(msg, vim.log.levels.WARN)
+        error(msg, 0)
+      end
+    end
+
+    -- Close all used channels. Prevents `too many open files` type of errors.
+    pcall(vim.fn.chanclose, job_channel)
+    pcall(vim.fn.chanclose, job_id)
+
+    -- Remove file for address to reduce chance of "can't open file" errors, as
+    -- address uses temporary unique files
+    pcall(vim.fn.delete, job_address)
+
+    child.job = nil
   end
 
   --- Unload fzf-lua and side effects
@@ -268,7 +348,10 @@ M.new_child_neovim = function()
     local screenshot_opts = { redraw = opts.redraw }
     opts.redraw = nil
     opts.force = not not vim.env["update_screenshots"]
-    MiniTest.expect.reference_screenshot(child.get_screenshot(screenshot_opts), path, opts)
+    child.wait_screen_stable()
+    child.screen_invalidate()
+    screenshot.with_retry(MiniTest.expect.reference_screenshot,
+      function() return child.get_screenshot(screenshot_opts) end, path, opts)
   end
 
   ---@alias test.ScreenOpts { start_line: integer?, end_line: integer?, no_ruler: boolean?,
@@ -292,7 +375,10 @@ M.new_child_neovim = function()
     }
     opts.redraw = nil
     opts.force = not not vim.env["update_screenshots"]
-    screenshot.reference_screenshot(child.get_screen_lines(screenshot_opts), path, opts)
+    child.wait_screen_stable()
+    child.screen_invalidate()
+    screenshot.with_retry(screenshot.reference_screenshot,
+      function() return child.get_screen_lines(screenshot_opts) end, path, opts)
   end
 
   ---@param opts test.ScreenOpts
@@ -314,7 +400,8 @@ M.new_child_neovim = function()
     }
     opts.redraw = nil
     opts.force = not not vim.env["update_screenshots"]
-    screenshot.reference_screenshot(child.get_buf_lines(buf, screenshot_opts), path, opts)
+    screenshot.with_retry(screenshot.reference_screenshot,
+      function() return child.get_buf_lines(buf, screenshot_opts) end, path, opts)
   end
 
   ---@param str string
@@ -352,6 +439,36 @@ M.new_child_neovim = function()
       tostring(child.cmd_capture("messages")),
       tostring(child.get_screenshot())
     ))
+  end
+
+  --- Wait until consecutive child screenshots are identical, e.g. the UI
+  --- finished rendering (fzf previews spawn nested processes and resize
+  --- windows asynchronously, fixed sleeps are not enough on slow machines).
+  --- No-op on Linux where screenshots are not flakey and this only adds time.
+  ---@param opts? { timeout?: integer, interval?: integer }
+  child.wait_screen_stable = function(opts)
+    if M.IS_LINUX() then return end
+    opts = opts or {}
+    local timeout, interval = opts.timeout or 2500, opts.interval or 200
+    local prev = tostring(child.get_screen_lines({}))
+    for _ = interval, timeout, interval do
+      vim.uv.sleep(interval)
+      local cur = tostring(child.get_screen_lines({}))
+      if cur == prev then return end
+      prev = cur
+    end
+  end
+
+  --- On Windows, moving/closing floating windows can leave previously
+  --- composited cells behind (the vacated region is not always redrawn),
+  --- e.g. the fzf term float moving from its initial fullscreen position
+  --- to the picker's final layout, or the preview scrollbar thumb moving
+  --- over the preview border. Plain `:redraw` skips cells it deems valid,
+  --- so invalidate the whole screen to refetch every cell from the current
+  --- window layout (no-op on Linux where this is not needed).
+  child.screen_invalidate = function()
+    if M.IS_LINUX() then return end
+    child.api.nvim__redraw({ valid = false, flush = true })
   end
 
   --- waits until child screenshot contains text
@@ -458,6 +575,7 @@ M.FzfLua = setmetatable({}, {
       -- on MacOs but I actually like it that we're testing `fn_postprocess` as well as
       -- RPC connection from child to main instance using with `_G._fzf_lua_server`
       if ci_opts.__postprocess_wait then
+        ---@diagnostic disable-next-line: undefined-field
         opts.fn_postprocess = opts.multiprocess
             and [[return function(opts)
               local chan_id = vim.fn.sockconnect("pipe", _G._fzf_lua_server, { rpc = true })

@@ -1,10 +1,29 @@
 nvim ?= nvim
 
 #
+# Run under git-bash on Windows (requires: scoop install make git)
+#
+ifeq ($(OS),Windows_NT)
+  ifneq ($(MSYSTEM),)
+  else
+    BASH_DIR := C:/Users/$(USERNAME)/scoop/apps/git/current/usr/bin
+    ifneq ($(shell [ -f "$(BASH_DIR)/bash.exe" ] && echo 1),)
+      $(info Using git-bash "$(BASH_DIR)/bash.exe")
+      export PATH := $(BASH_DIR):$(PATH)
+      SHELL := bash
+      .SHELLFLAGS := -c
+    endif
+  endif
+endif
+
+#
 # Run all tests or specic module tests
 #
-# Test both stable and nightly (assuming `nv` is linked to nightly):
-# `make test nvim=nv` or `make test nvim="nvim nv"` (for both)
+# Test nightly:
+# `make test nvim=/home/bhagwan/Sources/nvim/neovim/build/bin/nvim
+#
+# Test both stable and nightly:
+# `make test nvim="nvim /home/bhagwan/Sources/nvim/neovim/build/bin/nvim"`
 #
 # Test specific module(s) with `make test glob=file`
 # NOTE: glob is resolved using `vim.fn.globpath` so we can also run:
@@ -15,7 +34,13 @@ test:
 	for nvim_exec in $(nvim); do \
 		printf "\n======\n\n" ; \
 		$$nvim_exec --version | head -n 1 && echo '' ; \
-		$$nvim_exec --headless --noplugin -u ./scripts/minimal_init.lua \
+		VIMRUNTIME="$$($$nvim_exec --clean --headless +'echo $$VIMRUNTIME' +q 2>/dev/null)" ; \
+		if [ -z "$$VIMRUNTIME" ] || [ ! -d "$$VIMRUNTIME" ]; then \
+			VIMRUNTIME="$$(realpath "$$(dirname "$$nvim_exec")/../../runtime")" ; \
+			[ -d "$$VIMRUNTIME" ] || unset VIMRUNTIME ; \
+		fi ; \
+		VIMRUNTIME="$$VIMRUNTIME" FZF_LUA_NVIM_RUNTIME="$$VIMRUNTIME" \
+			$$nvim_exec --headless --noplugin -u ./scripts/minimal_init.lua \
 			-l ./scripts/make_cli.lua ; \
 	done
 
@@ -45,7 +70,11 @@ deps:
 	git clone --depth=1 --single-branch https://github.com/mfussenegger/nvim-dap.git deps/nvim-dap
 
 
-# Target to clone the repository and checkout the specific SHA
+# Target to clone the repository and checkout the specific SHA.
+# Pinning a fixed SHA ensures that fzf test screenshots remain
+# deterministic — the screenshots include total file counts and
+# file ordering, both of which would change if the working tree's
+# current state (or different commits) were used instead.
 SHA=abe5ecafebb4e24feb162384d5f492431036e791
 .PHONY: deps/fzf-lua
 deps/fzf-lua:
@@ -53,15 +82,103 @@ deps/fzf-lua:
 	git clone .git $@
 	(cd $@ && git checkout $(SHA))
 
+# Download the emmylua binaries (emmylua_check + luafmt) from upstream
+# if `gh` is available and they are not already on the system PATH.
+# Binaries are extracted into .emmylua/.
+EMMYLUA_DIR=.emmylua
+# Pin the emmylua release tag to download. Set to an empty
+# string (EMMYLUA_VERSION=) to fetch the latest release instead.
+EMMYLUA_VERSION=0.25.1
+# OS arch detection for the emmylua binaries (Darwin/Linux/Windows,
+# x64/arm64). Falls back to linux-x64 on unknown platforms; override
+# by passing EMMY_CHECK_ASSET=<asset filename> or LUA_FMT_ASSET=<asset
+# filename> on the make command line. Windows releases are shipped as
+# `.zip` under the `win32-*` asset names.
+EMMY_UNAME_S=$(shell uname -s 2>/dev/null)
+EMMY_UNAME_M=$(shell uname -m 2>/dev/null)
+EMMY_ARCH=$(if $(filter aarch64% arm64%,$(EMMY_UNAME_M)),arm64,x64)
+ifeq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(EMMY_UNAME_S)),)
+  EMMY_OS=$(if $(filter Darwin darwin,$(EMMY_UNAME_S)),darwin,linux)
+  EMMY_EXT:=
+  EMMY_EXT_ARCHIVE:=.tar.gz
+else
+  EMMY_OS:=win32
+  EMMY_EXT:=.exe
+  EMMY_EXT_ARCHIVE:=.zip
+endif
+# Linux arm64 release assets are published with the "aarch64-glibc.2.17"
+# suffix; darwin/win32 use the plain "arm64" suffix.
+EMMY_ARCH_ASSET=$(if $(and $(filter linux,$(EMMY_OS)),$(filter arm64,$(EMMY_ARCH))),aarch64-glibc.2.17,$(EMMY_ARCH))
+EMMY_CHECK_ASSET=emmylua_check-$(EMMY_OS)-$(EMMY_ARCH_ASSET)$(EMMY_EXT_ARCHIVE)
+LUA_FMT_ASSET=luafmt-$(EMMY_OS)-$(EMMY_ARCH_ASSET)$(EMMY_EXT_ARCHIVE)
+EMMY_CHECK_BIN=$(EMMYLUA_DIR)/emmylua_check$(EMMY_EXT)
+LUA_FMT_BIN=$(EMMYLUA_DIR)/luafmt$(EMMY_EXT)
+
+.PHONY: deps/emmylua
+deps/emmylua:
+	@mkdir -p $(EMMYLUA_DIR) ; \
+	if [ ! -x "$(EMMY_CHECK_BIN)" ] && ! command -v emmylua_check >/dev/null 2>&1; then \
+		if ! command -v gh >/dev/null 2>&1; then \
+			echo "gh is required to download emmylua_check" >&2 ; \
+			exit 1 ; \
+		fi ; \
+		echo "Downloading emmylua_check $(if $(EMMYLUA_VERSION),v$(EMMYLUA_VERSION),latest) [$(EMMY_CHECK_ASSET)]..." ; \
+		gh release download --clobber -R EmmyLuaLs/emmylua-analyzer-rust \
+			$(if $(EMMYLUA_VERSION),"$(EMMYLUA_VERSION)") \
+			-p "$(EMMY_CHECK_ASSET)" -D $(EMMYLUA_DIR) && \
+		case "$(EMMY_CHECK_ASSET)" in \
+			*.zip) unzip -o "$(EMMYLUA_DIR)/$(EMMY_CHECK_ASSET)" -d $(EMMYLUA_DIR) 2>/dev/null || \
+				powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(EMMYLUA_DIR)/$(EMMY_CHECK_ASSET)' -DestinationPath '$(EMMYLUA_DIR)'" ;; \
+			*) tar xzf "$(EMMYLUA_DIR)/$(EMMY_CHECK_ASSET)" -C $(EMMYLUA_DIR) ;; \
+		esac && \
+		rm -f "$(EMMYLUA_DIR)/$(EMMY_CHECK_ASSET)" ; \
+	fi ; \
+	if [ ! -x "$(LUA_FMT_BIN)" ] && ! command -v luafmt >/dev/null 2>&1; then \
+		if ! command -v gh >/dev/null 2>&1; then \
+			echo "gh is required to download luafmt" >&2 ; \
+			exit 1 ; \
+		fi ; \
+		echo "Downloading luafmt $(if $(EMMYLUA_VERSION),v$(EMMYLUA_VERSION),latest) [$(LUA_FMT_ASSET)]..." ; \
+		gh release download --clobber -R EmmyLuaLs/emmylua-analyzer-rust \
+			$(if $(EMMYLUA_VERSION),"$(EMMYLUA_VERSION)") \
+			-p "$(LUA_FMT_ASSET)" -D $(EMMYLUA_DIR) && \
+		case "$(LUA_FMT_ASSET)" in \
+			*.zip) unzip -o "$(EMMYLUA_DIR)/$(LUA_FMT_ASSET)" -d $(EMMYLUA_DIR) 2>/dev/null || \
+				powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(EMMYLUA_DIR)/$(LUA_FMT_ASSET)' -DestinationPath '$(EMMYLUA_DIR)'" ;; \
+			*) tar xzf "$(EMMYLUA_DIR)/$(LUA_FMT_ASSET)" -C $(EMMYLUA_DIR) ;; \
+		esac && \
+		rm -f "$(EMMYLUA_DIR)/$(LUA_FMT_ASSET)" ; \
+	fi
+
 .PHONY: lint
-lint:
-	VIMRUNTIME="$$(nvim --clean --headless +'echo $$VIMRUNTIME' +q 2>&1)" lua-language-server --configpath=../.luarc.jsonc --check=.
+lint: emmylua-check
 
 .PHONY: emmylua-check
-emmylua-check:
+emmylua-check: | deps/emmylua
+	@if [ -x "$(EMMY_CHECK_BIN)" ]; then \
+		EMMY="$(EMMY_CHECK_BIN)" ; \
+	else \
+		EMMY="emmylua_check" ; \
+	fi ; \
 	VIMRUNTIME="$$(nvim --clean --headless +'echo $$VIMRUNTIME' +q 2>&1)" \
-		emmylua_check . \
-			--ignore 'deps/**/*'
+		$$EMMY . --ignore 'deps/**/*' --warnings-as-errors
+
+.PHONY: fmt fmtcheck
+fmt: | deps/emmylua
+	@if [ -x "$(LUA_FMT_BIN)" ]; then \
+		FMT="$(LUA_FMT_BIN)" ; \
+	else \
+		FMT="luafmt" ; \
+	fi ; \
+	$$FMT --config .luafmt.toml --write --recursive ./lua ./tests
+
+fmtcheck: | deps/emmylua
+	@if [ -x "$(LUA_FMT_BIN)" ]; then \
+		FMT="$(LUA_FMT_BIN)" ; \
+	else \
+		FMT="luafmt" ; \
+	fi ; \
+	$$FMT --config .luafmt.toml --check --recursive ./lua ./tests
 
 gen:
 	nvim --clean -l lua/fzf-lua/init.lua

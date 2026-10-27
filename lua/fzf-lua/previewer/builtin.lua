@@ -41,6 +41,10 @@ local Previewer = {}
 ---@field clear_on_redraw boolean?
 ---@field timers? table<string, uv.uv_timer_t?>
 ---@field orig_pos? [integer, integer]
+-- Methods are added to `Previewer.base`/`buffer_or_file` via `Object:extend()`'s
+-- `__index` chain; emmylua 0.25.x can't see through this, so `self:method()` and
+-- undeclared fields show as `never` / undefined. Real type errors are fixed inline.
+---@diagnostic disable: call-non-callable, undefined-field
 Previewer.base = Object:extend()
 
 ---@param o table
@@ -98,7 +102,7 @@ function Previewer.base:setup_opts(opts)
   -- fzf 0.40 added 'zero' event for when there's no match
   -- clears the preview when there are no matching entries
   if utils.has(opts, "fzf", { 0, 40 }) then
-    table.insert(opts._fzf_cli_args, "--bind=" .. libuv.shellescape("zero:+" .. self:zero()))
+    table.insert(opts._fzf_cli_args, libuv.cli_raw_arg("--bind=", "zero:+" .. self:zero()))
   end
   return opts
 end
@@ -189,6 +193,7 @@ end
 ---@param min_winopts boolean?
 ---@param no_wipe boolean?
 function Previewer.base:set_preview_buf(newbuf, min_winopts, no_wipe)
+  ---@cast self fzf-lua.previewer.Builtin
   if not self.win or not self.win:validate_preview() then return end
   -- Set the preview window to the new buffer
   local curbuf = api.nvim_win_get_buf(self.win.preview_winid)
@@ -305,7 +310,7 @@ function Previewer.base:display_entry(entry_str)
     if not self.win or not self.win:validate_preview() then return end
 
     -- specialized previewer populate function
-    ---@cast self fzf-lua.previewer.BufferOrFile base class def don't make sense here
+    ---@cast self fzf-lua.previewer.BufferOrFile
     if self:populate_preview_buf(entry_str_) == false then return end
 
     -- reset the preview window highlights
@@ -321,7 +326,7 @@ end
 function Previewer.base:cmdline(_)
   local act = shell.stringify_data(function(items, _, _)
     ---@type string?, string?, string?
-    local entry, query, idx = unpack(items, 1, 3)
+    local entry, idx, query = unpack(items, 1, 3)
     -- NOTE: see comment regarding {n} in `core.convert_exec_silent_actions`
     -- convert empty string to nil
     if not tonumber(idx) then entry = nil end
@@ -333,7 +338,7 @@ function Previewer.base:cmdline(_)
     -- save last entry even if we don't display
     self.last_entry = entry
     return ""
-  end, self.opts, "{} {q} {n}")
+  end, self.opts, "{} {n} {q}")
   return act
 end
 
@@ -353,13 +358,26 @@ function Previewer.base:zero(_)
     shell.stringify_data(function(_, _, _)
       -- upvalue incase previewer was detached/re-attached (global picker)
       self = self.win._previewer or self ---@type fzf-lua.previewer.Builtin
+      -- capture the entry displayed at zero-event time; if a different entry
+      -- is displayed before the deferred callback runs (e.g. the list was
+      -- still loading on Windows) the preview belongs to that newer entry
+      local entry_at_zero = self.last_entry
       vim.defer_fn(function()
-        if self.win:validate_preview() then
+        -- a new entry may have been displayed after the zero event, don't
+        -- clear its preview (only clear when the entry is unchanged)
+        local cur_entry = self.last_entry
+        if cur_entry == entry_at_zero and self.win:validate_preview() then
           self:clear_preview_buf(true)
           TSContext.close(self.win.preview_winid)
           self.win:update_preview_title("")
         end
-        if self.loaded_entry then self.last_entry = nil end
+        -- only reset when `last_entry` still refers to the zero-event entry:
+        -- a newer entry set by `display_entry` (whose preview was kept above)
+        -- stays so `display_last_entry` can restore it, e.g. when the
+        -- preview window is toggled back on
+        if self.loaded_entry and cur_entry == entry_at_zero then
+          self.last_entry = nil
+        end
         fn.delete(self._zero_lock, "d")
       end, self.delay)
     end, self.opts, ""))
@@ -468,6 +486,7 @@ local copy_extmarks = function(src_buf, buf, win, topline, botline, ns)
     if not ignore[details.ns_id] then
       details.ns_id = nil
       if no_virt_text and details.virt_text then details.virt_text = nil end
+      ---@diagnostic disable-next-line: param-type-mismatch
       pcall(api.nvim_buf_set_extmark, buf, ns, row, col, details)
     end
   end
@@ -511,6 +530,7 @@ end
 
 ---@class fzf-lua.previewer.BufferOrFile : fzf-lua.previewer.Builtin,{}
 ---@field match_id? integer
+---@field loaded_entry? fzf-lua.buffer_or_file.Entry
 ---@field super fzf-lua.previewer.Builtin
 Previewer.buffer_or_file = Previewer.base:extend()
 
@@ -576,10 +596,11 @@ function Previewer.buffer_or_file:parse_entry(entry_str, _cb)
     local ext = path.extension(entry.path)
     local cmd = ext and self.extensions[ext:lower()] or nil
     cmd = type(cmd) == "string" and { cmd } or utils.deepcopy(cmd) or {}
+    ---@cast cmd string[]
     if cmd[1] then
       -- special case: we build ueberzug cmd separately
-      entry._is_ueberzug = cmd[1]:match("ueberzug") and true or false
-      if not entry._is_ueberzug and fn.executable(cmd[1]) == 1 then
+      entry._is_ueberzug = (cmd[1] --[[@as string]]):match("ueberzug") and true or false
+      if not entry._is_ueberzug and fn.executable(cmd[1] --[[@as string]]) == 1 then
         entry.cmd = replace_placeholder(cmd, "[<{]file[}>]", entry.path)
         entry.pty = true
       end
@@ -789,6 +810,8 @@ local start_cmd = function(buf, entry, opts)
   end)
   local sopts = entry.cmd_opts or {}
   sopts = vim.tbl_deep_extend("force", sopts, { stdout = stdout, stderr = stdout })
+  ---@diagnostic disable-next-line: param-type-mismatch
+  ---@diagnostic disable-next-line: redundant-parameter
   return vim.system(entry.cmd, sopts, on_exit)
 end
 
@@ -842,6 +865,7 @@ function Previewer.buffer_or_file:_populate_loaded_buffer_preview(tmpbuf, entry)
   -- this changes the buffer's 'getbufinfo[1].lastused'
   -- which messes up our `buffers()` sort
   entry.filetype = vim.bo[entry.bufnr].filetype
+  ---@diagnostic disable-next-line: param-type-mismatch
   local lines = api.nvim_buf_get_lines(entry.bufnr, 0, -1, false)
   vim.bo[tmpbuf].expandtab = vim.bo[entry.bufnr].expandtab
   vim.bo[tmpbuf].shiftwidth = vim.bo[entry.bufnr].shiftwidth
@@ -860,6 +884,7 @@ function Previewer.buffer_or_file:_populate_location_preview(tmpbuf, entry)
   local loc = { uri = entry.uri, range = entry.range }
   local win = self.win.preview_winid
   local ok, res = api.nvim_win_call(win, function()
+    ---@diagnostic disable-next-line: param-type-mismatch
     return pcall(utils.jump_to_location, loc, "utf-16", false)
   end)
   if ok then
@@ -946,13 +971,14 @@ end
 ---@param entry_str string
 ---@return false? no preview
 function Previewer.buffer_or_file:populate_preview_buf(entry_str)
+  ---@cast self fzf-lua.previewer.BufferOrFile
   if not self.win or not self.win:validate_preview() then return end
   local co = assert(coroutine.running())
   -- schedule can avoid "cannot resume running coroutine"
   local entry = self:parse_entry(entry_str,
     vim.schedule_wrap(function(res) assert(coroutine.resume(co, res)) end))
   self._last_entry = entry_str
-  entry = entry or coroutine.yield()
+  entry = entry or coroutine.yield() ---@cast entry fzf-lua.buffer_or_file.Entry
   if entry_str ~= self._last_entry or not self.win:validate_preview() then return false end
   if utils.tbl_isempty(entry) then return end
 
@@ -965,7 +991,7 @@ function Previewer.buffer_or_file:populate_preview_buf(entry_str)
     return
   end
   -- check if cached is update-to-date to be reuse
-  local cached, stale = self.bcache:check(entry)
+  local cached, stale = self.bcache:check(entry) ---@cast cached fzf-lua.BcacheEntry?
   entry.cached = cached
 
   if cached and not stale then
@@ -974,7 +1000,8 @@ function Previewer.buffer_or_file:populate_preview_buf(entry_str)
   end
 
   -- if cached exists, must be stale, otherwise alloc a new buffer
-  local buf = (cached or {}).bufnr or self:get_tmp_buffer()
+  local buf ---@type integer
+  if cached then buf = cached.bufnr else buf = self:get_tmp_buffer() end
 
   if entry.bufnr and api.nvim_buf_is_loaded(entry.bufnr) and vim.bo[entry.bufnr].filetype ~= "image" then
     self:_populate_loaded_buffer_preview(buf, entry)
@@ -1052,6 +1079,7 @@ function Previewer.base:update_render_markdown()
     return
   end
   if package.loaded["render-markdown"] then
+    ---@diagnostic disable-next-line: unresolved-require
     require("render-markdown").render({ buf = bufnr, event = "FzfLua" })
   elseif package.loaded["markview"] then
     --- Render strictly to save performance.
@@ -1059,6 +1087,7 @@ function Previewer.base:update_render_markdown()
     --- Use `strict:render(bufnr, 1000)` to stop rendering if
     --- line count >= 1000.
     local strict = package.loaded["markview"].strict_render;
+    ---@diagnostic disable-next-line: undefined-field
     if strict then strict:render(bufnr); end
   end
 end
@@ -1302,6 +1331,7 @@ function Previewer.buffer_or_file:set_cursor_hl(entry)
   end
 
   self.orig_pos = { lnum, col - 1 }
+  ---@diagnostic disable-next-line: param-type-mismatch
   if not pcall(api.nvim_win_set_cursor, win, cached_pos or self.orig_pos) then
     return
   end
@@ -1318,12 +1348,16 @@ function Previewer.buffer_or_file:set_cursor_hl(entry)
     ---@diagnostic disable-next-line: param-type-mismatch
     local reg = utils.vim_regex(regex, { silent = true })
     if reg then
-      if case_sensitive then
-        regex_start, regex_end = reg:match_line(buf, lnum - 1, col - 1)
-      else
-        local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
-        regex_start, regex_end = reg:match_str(line:sub(col):lower())
-      end
+      regex_start, regex_end = utils.npcall(function()
+        if case_sensitive then
+          ---@diagnostic disable-next-line: redundant-return-value
+          return reg:match_line(buf, lnum - 1, col - 1)
+        else
+          local line = api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+          ---@diagnostic disable-next-line: redundant-return-value
+          return reg:match_str(line:sub(col):lower())
+        end
+      end)
     end
     if regex_start and regex_end then
       extmark = api.nvim_buf_set_extmark(buf, self.ns_previewer, lnum - 1, regex_start + col - 1, {
@@ -1371,6 +1405,7 @@ end
 ---@param entry fzf-lua.buffer_or_file.Entry
 ---@param min_winopts boolean?
 function Previewer.buffer_or_file:preview_buf_post(entry, min_winopts)
+  ---@cast self fzf-lua.previewer.BufferOrFile
   if not self.win or not self.win:validate_preview() then return end
 
   -- set cursor highlights for line|col or tag
@@ -1404,7 +1439,7 @@ function Previewer.buffer_or_file:preview_buf_post(entry, min_winopts)
   -- save the loaded entry so we can compare
   -- bufnr|path with the next entry. If equal
   -- we can skip loading the buffer again
-  self.loaded_entry = entry
+  self.loaded_entry = entry --[[@as fzf-lua.buffer_or_file.Entry]]
 
   -- Should we cache the current preview buffer?
   -- we cache only named buffers with valid path/uri
@@ -1485,6 +1520,7 @@ function Previewer.man_pages:parse_entry(entry_str)
   local entry = require("fzf-lua.providers.manpages").manpage_sh_arg(entry_str)
   local cmd = self.cmd:format(entry) ---@type string|string[]
   if type(cmd) == "string" then cmd = { "sh", "-c", cmd } end
+  ---@cast cmd string[]
   local output, _ = utils.io_systemlist(cmd)
   return { filetype = "man", content = output }
 end
@@ -1532,7 +1568,7 @@ function Previewer.jumps:parse_entry(entry_str)
   if filepath then
     local ok, res = pcall(libuv.expand, filepath)
     if ok then
-      filepath = path.relative_to(res, utils.cwd())
+      filepath = path.relative_to(res --[[@as string]], utils.cwd())
     end
     if not uv.fs_stat(filepath) then
       -- file is not accessible,
@@ -1612,10 +1648,13 @@ function Previewer.quickfix:parse_entry(entry_str)
   local nr = entry_str:match("[(%d+)]")
   if not nr or tonumber(nr) <= 0 then return {} end
   local qf_list = self.opts.is_loclist and
+      ---@diagnostic disable-next-line: assign-type-mismatch
       fn.getloclist(self.win.src_winid, { all = "", nr = tonumber(nr) })
+      ---@diagnostic disable-next-line: assign-type-mismatch
       or fn.getqflist({ all = "", nr = tonumber(nr) })
   if utils.tbl_isempty(qf_list) or utils.tbl_isempty(qf_list.items) then return {} end
   local lines = {}
+      ---@diagnostic disable-next-line: param-type-mismatch
   for _, e in ipairs(qf_list.items) do
     table.insert(lines, string.format("%s|%d col %d|%s",
       path.HOME_to_tilde(path.relative_to(
@@ -1771,8 +1810,10 @@ function Previewer.vterm:parse_entry(entry_str)
   local entry = Previewer.vterm.super.parse_entry(self, entry_str)
   local spec = self.previewer:cmdline() ---@type fzf-lua.preview.spec
   assert(type(spec) == "table" and spec.fn, "invalid vterm previewer spec")
+  ---@diagnostic disable-next-line: need-check-nil
   local preview = assert(self.win.layout.preview)
   -- usually `{} {q}` is used as most common field index
+  ---@diagnostic disable-next-line: param-type-mismatch
   local res = spec.fn({ entry_str, FzfLua.get_info().query }, preview.height, preview.width)
   if spec.type == "cmd" then
     local cmdspec = type(res) == "table" and res or { cmd = { "sh", "-c", res }, env = nil }
@@ -1780,6 +1821,7 @@ function Previewer.vterm:parse_entry(entry_str)
     return { cmd = cmd, cmd_opts = { env = cmdspec.env }, line = entry.line, col = entry.col }
   else
     assert(type(res) == "table", res)
+    ---@diagnostic disable-next-line: assign-type-mismatch
     return { content = res, open_term = true, line = entry.line, col = entry.col }
   end
 end

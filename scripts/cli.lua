@@ -1,7 +1,9 @@
 ---@diagnostic disable-next-line: deprecated
 local api, uv, fn = vim.api, vim.uv or vim.loop, vim.fn
 assert(#api.nvim_list_uis() == 0)
-local __FILE__ = debug.getinfo(1, "S").source:gsub("^@", "")
+local _info = debug.getinfo(1, "S")
+---@cast _info {source: string}
+local __FILE__ = _info.source:gsub("^@", "")
 local dir = fn.fnamemodify(fn.resolve(__FILE__), ":h:h:p")
 vim.opt.rtp:append(dir)
 vim.cmd.runtime("plugin/fzf-lua.lua")
@@ -51,6 +53,48 @@ for _, config_path in ipairs(config_paths) do
 end
 
 _G.fzf_jobstart = function(cmd, opts)
+  if fn.has("win32") == 1 or fn.has("win64") == 1 then
+    -- One managed Windows route: `fzf.raw_fzf` hands us a `win_spawn` spec
+    -- (raw argv, result file, optional item command); `libuv.win_spawn`
+    -- runs fzf directly via `uv.spawn` -- no shell, no escaping, no
+    -- PowerShell fallback, results via file descriptor and the item
+    -- command piped into fzf's stdin (see `libuv.win_spawn`).
+    if cmd.__win_spawn then
+      FzfLua.libuv.win_spawn(cmd.__win_spawn, {
+        on_exit = vim.schedule_wrap(function(rc)
+          opts.on_exit(nil, rc, nil)
+          if not opts.no_quit and #api.nvim_get_proc_children(fn.getpid()) == 0 then
+            vim.cmd.cquit { count = rc, bang = true }
+          end
+        end),
+      })
+      return
+    end
+    -- Legacy `cmd.exe` launcher for callers without raw segments (direct
+    -- `raw_fzf` invocations). Join argv verbatim for `cmd.exe`: the
+    -- caret-escaped args from `fzf.raw_fzf` are built for raw `cmd /c`
+    -- parsing and libuv quoting corrupts them ("...syntax is incorrect").
+    -- stderr: fzf's light renderer (`--height`) requires a console on
+    -- stderr (it draws the UI there and falls back to fullscreen without
+    -- one, see `IsLightRendererSupported` in src/tui/light_windows.go).
+    -- When the CLI's stderr is piped (e.g. shell widgets run through a
+    -- PSReadLine key handler), reopen `CONOUT$` so the picker renders the
+    -- same `--height` UI as when run directly from the prompt.
+    FzfLua.libuv.uv_spawn(cmd[1], {
+        cwd = opts.cwd,
+        args = vim.list_slice(cmd, 2),
+        stdio = { 0, 1, FzfLua.libuv.win_stderr_fd() },
+        env = opts.env,
+        verbatim = cmd[1] == "cmd.exe",
+      },
+      vim.schedule_wrap(function(rc)
+        opts.on_exit(nil, rc, nil)
+        if not opts.no_quit and #api.nvim_get_proc_children(fn.getpid()) == 0 then
+          vim.cmd.cquit { count = rc, bang = true }
+        end
+      end))
+    return
+  end
   FzfLua.libuv.uv_spawn(cmd[1], {
       cwd = opts.cwd,
       args = vim.list_slice(cmd, 2),
@@ -65,7 +109,9 @@ _G.fzf_jobstart = function(cmd, opts)
     end))
 end
 
-require("fzf-lua.cmd").run_command(unpack(_G.arg))
+local _cli_args = _G.arg
+---@cast _cli_args string[]
+require("fzf-lua.cmd").run_command(unpack(_cli_args) --[[@as string]])
 
 while true do
   vim.wait(100)

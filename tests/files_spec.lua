@@ -138,6 +138,11 @@ T["files"]["executable"] = new_set({ parametrize = { { "fd" }, { "rg" }, { "find
       exclude = [[{ "fd", "fdfind" }]]
       opts = { rg_opts = '--files -g "!.git" --sort=path -g !tests/**' }
     else
+      -- `dir /s/b` emits absolute paths (`<cwd>\file`), the cwd here is
+      -- `deps/fzf-lua` so the `findstr` filters can't reproduce the relative
+      -- `find` listing of the Linux reference (attribute and symlink
+      -- differences change the entry count as well)
+      helpers.SKIP_IF_WIN("`dir` output cannot match the linux `find` reference")
       exclude = [[{ "fd", "fdfind", "rg" }]]
       opts = {
         find_opts =
@@ -187,6 +192,24 @@ T["files"]["preview should work after chdir #1864"] = function()
       child.type_keys([[<c-n>]])
       sleep(100)
     end
+  })
+end
+
+T["files"]["ignore_current_file without icons #2788"] = function()
+  exec_lua([[vim.cmd.edit("LICENSE")]])
+  helpers.FzfLua.files(child, {
+    __expect_lines = true,
+    __screen_opts = { ignore_text = { 6, 28 } },
+    debug = 1,
+    hidden = false,
+    file_icons = false,
+    git_icons = false,
+    ignore_current_file = true,
+    previewer = false,
+    cwd_prompt = false,
+    multiprocess = true,
+    cmd = "rg --files --sort=path -g !tests/**",
+    query = "LICENSE",
   })
 end
 

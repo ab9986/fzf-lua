@@ -37,6 +37,14 @@ sh -c "$(curl -s https://raw.githubusercontent.com/ibhagwan/fzf-lua/main/scripts
 
 [![LuaRocks](https://img.shields.io/luarocks/v/ibhagwan/fzf-lua?logo=lua&color=purple)](https://luarocks.org/modules/ibhagwan/fzf-lua)
 
+Using [vim.pack](https://neovim.io/doc/user/pack/) and Neovim 0.12+
+
+```lua
+vim.pack.add({
+    { src = "https://github.com/ibhagwan/fzf-lua" },
+})
+```
+
 Using [lazy.nvim](https://github.com/folke/lazy.nvim)
 
 ```lua
@@ -936,6 +944,8 @@ previewers = {
     },
     bcommits = {
       prompt        = 'BCommits❯ ',
+      -- follow the buffer's history across renames
+      follow        = false,
       -- default preview shows a git diff vs the previous commit
       -- if you prefer to see the entire commit you can use:
       --   git show --color {1} --rotate-to={file}

@@ -6,9 +6,38 @@ local path = require "fzf-lua.path"
 local libuv = require "fzf-lua.libuv"
 
 ---@class fzf-lua.actions
----@field expect fun(actions: table, opts: fzf-lua.config.Resolved|{}):string[]?, string[]?
----@field [string] fun(items: string[], opts: fzf-lua.config.Resolved|{}):any
+---@field expect fun(actions: table, opts: fzf-lua.config.Resolved):string[]?, string[]?
+---@field [string] fun(items: string[], opts: fzf-lua.config.Resolved):any
 local M = {}
+
+---Capture the expanded `field_index` before the action is dispatched.
+---`field_index` was previously only expanded for `exec_silent` actions, so
+---regular actions (e.g. `reuse` in the CLI profile) only received the selected
+---entries and never the extra fields such as `$FZF_POS`.
+---@param key string
+---@param field_index string
+---@param opts table
+---@return string
+local action_fields_recorder = function(key, field_index, opts)
+  return require("fzf-lua.shell").stringify_data2(function(items)
+    opts.__action_fields = opts.__action_fields or {}
+    -- An all-empty capture means the field expression produced no values
+    -- (e.g. no selection), treat it as absent so `actions.act` falls back
+    -- to the entries table instead of passing empty fields to the action.
+    local is_empty = true
+    for _, item in ipairs(items or {}) do
+      if item ~= "" then
+        is_empty = false
+        break
+      end
+    end
+    if is_empty then
+      opts.__action_fields[key] = nil
+    else
+      opts.__action_fields[key] = items
+    end
+  end, opts, field_index)
+end
 
 -- return fzf '--expect=' string from actions keyval tbl
 -- on fzf >= 0.53 add the `prefix` key to the bind flags
@@ -35,11 +64,24 @@ M.expect = function(actions, opts)
         -- `print(...)` action was only added with fzf 0.53
         -- NOTE: we can no longer combine `--expect` and `--bind` as this will
         -- print an extra empty line regardless of the pressaed keybind (#1241)
-        table.insert(binds, string.format("%s:print(%s)%s%s+accept",
+        --
+        -- Capture `field_index` for regular actions (e.g. `reuse`) before
+        -- dispatching, mimicking the `exec_silent` conversion which receives
+        -- the expanded fields as its selection. Selection-changing prefixes
+        -- (e.g. `select-all`) must run first so the recorder sees the same
+        -- selection fzf accepts. `execute-silent` blocks until the recorder
+        -- exits, so the fields are available when `actions.act` runs after
+        -- fzf exits.
+        local prefix = v.prefix and v.prefix:gsub("accept$", ""):gsub("%+$", "") or ""
+        local prefix_bind = prefix ~= "" and (prefix .. "+") or ""
+        local recorder = v.field_index and not v.exec_silent
+            and ("execute-silent(%s)+"):format(action_fields_recorder(k, v.field_index, opts))
+            or ""
+        table.insert(binds, string.format("%s:print(%s)+%s%saccept",
           k,
           k,
-          v.prefix and "+" or "",
-          v.prefix and v.prefix:gsub("accept$", ""):gsub("%+$", "") or ""
+          prefix_bind,
+          recorder
         ))
       elseif utils.has(opts, "sk", { 0, 14 }) then
         -- sk 0.14 deprecated `--expect`, instead `accept(<key>)` should be used
@@ -62,13 +104,14 @@ M.expect = function(actions, opts)
 end
 
 ---@param selected string[]
----@param opts fzf-lua.config.Resolved|{}
+---@param opts fzf-lua.config.Resolved
 ---@return string?, string[]?
 M.normalize_selected = function(selected, opts)
   -- The below separates the keybind from the item(s)
   -- and makes sure 'selected' contains only item(s) or {}
   -- so it can always be enumerated safely
   if not selected then return end
+  ---@diagnostic disable-next-line: unnecessary-assert
   local actions = assert(opts.actions)
   -- Backward compat, "default" action trumps "enter"
   if actions.default then actions.enter = actions.default end
@@ -123,7 +166,15 @@ M.act = function(selected, opts)
     --   (1) map containing action properties (reload, noclose, etc)
     --   (2) array of actions to be executed serially
     if action.fn then
-      action.fn(entries, opts)
+      -- Actions with `field_index` receive the expanded fields captured by
+      -- `execute-silent` before fzf accepted, falling back to the entries when
+      -- no capture happened (e.g. custom binds or fzf < 0.53).
+      local fields
+      if action.field_index and opts.__action_fields then
+        fields = opts.__action_fields[keybind]
+        opts.__action_fields[keybind] = nil
+      end
+      action.fn(fields or entries, opts)
     else
       for _, f in ipairs(action) do
         f(entries, opts)
@@ -202,7 +253,7 @@ end
 
 ---@param vimcmd string?
 ---@param selected string[]
----@param opts fzf-lua.config.Resolved|{}
+---@param opts fzf-lua.config.Resolved
 ---@param bufedit boolean?
 ---@return string?
 M.vimcmd_entry = function(vimcmd, selected, opts, bufedit)
@@ -273,8 +324,9 @@ M.vimcmd_entry = function(vimcmd, selected, opts, bufedit)
       elseif not opts.no_action_set_cursor and (entry.line > 0 or entry.col > 0) then
         -- Make sure we have valid line/column
         -- e.g. qf lists from files (no line/col), dap_breakpoints
-        ---@diagnostic disable-next-line: param-type-mismatch
-        pcall(vim.api.nvim_win_set_cursor, 0, { math.max(1, entry.line), math.max(1, entry.col) - 1 })
+        pcall(vim.api.nvim_win_set_cursor, 0, {
+          (math.max(1, entry.line --[[@as integer]]) --[[@as integer]]),
+          (math.max(1, entry.col --[[@as integer]]) - 1 --[[@as integer]]) })
       end
       -- Only "zz" after the last entry is loaded into the origin buffer
       if i == #selected and not opts.no_action_zz and not utils.is_term_buffer(0) then
@@ -343,6 +395,7 @@ local sel_to_qf = function(selected, opts, is_loclist)
 end
 
 M.list_del = function(selected, opts)
+  ---@diagnostic disable-next-line: unnecessary-assert
   local winid = assert(opts.__CTX.winid)
   local list = opts.is_loclist and vim.fn.getloclist(winid) or vim.fn.getqflist()
   local bufs = vim.tbl_map(function(s) return tonumber(s:match("%[(%d+)%]")) end, selected)
@@ -403,8 +456,10 @@ M.file_switch = function(selected, opts)
   winid = utils.winid_from_tabh(0, entry.bufnr)
   if not winid then return false end
   vim.api.nvim_set_current_win(winid)
-  if entry.line > 0 or entry.col > 0 then ---@diagnostic disable-next-line: param-type-mismatch
-    pcall(vim.api.nvim_win_set_cursor, 0, { math.max(1, entry.line), math.max(1, entry.col) - 1 })
+  if entry.line > 0 or entry.col > 0 then
+    pcall(vim.api.nvim_win_set_cursor, 0, {
+      (math.max(1, entry.line --[[@as integer]]) --[[@as integer]]),
+      (math.max(1, entry.col --[[@as integer]]) - 1 --[[@as integer]]) })
   end
   if not utils.is_term_buffer(0) and not opts.no_action_zz then vim.cmd("norm! zvzz") end
   return true
@@ -525,20 +580,24 @@ M.ex_run = function(selected)
   local cmd = selected[1]
   vim.cmd("stopinsert")
   vim.fn.feedkeys(string.format(":%s", cmd), "nt")
-  return cmd
 end
 
 M.ex_run_cr = function(selected)
   if not selected[1] then return end
   local cmd = selected[1]
-  vim.cmd(cmd)
+  local keys = string.format("<Cmd>%s<CR>", cmd:gsub("<", "<lt>"))
+  keys = vim.api.nvim_replace_termcodes(keys, true, true, true)
+  vim.api.nvim_feedkeys(keys, 'nt', false)
   vim.fn.histadd("cmd", cmd)
 end
 
 M.exec_menu = function(selected)
   if not selected[1] then return end
-  local cmd = selected[1]
-  vim.cmd("emenu " .. cmd)
+  local menu = selected[1]
+  local k_cmd = vim.api.nvim_replace_termcodes("<Cmd>", true, false, true)
+  local cmd = vim.fn.json_encode("emenu " .. vim.fn.escape(menu, "\\ |"))
+  local keys = string.format("%sexecute %s\r", k_cmd, cmd)
+  vim.api.nvim_feedkeys(keys, 'nt', false)
 end
 
 
@@ -557,28 +616,53 @@ M.search_cr = function(selected, opts)
 end
 
 ---@param kind ":"|"/"
+---@param pos integer zero-based picker position
+---@param reverse_list? boolean
+---@return integer?
+local hist_index = function(kind, pos, reverse_list)
+  local histnr = vim.fn.histnr(kind)
+  local from = reverse_list and 1 or histnr
+  local to = reverse_list and histnr or 1
+  local step = reverse_list and 1 or -1
+  local n = 0
+  for i = from, to, step do
+    if vim.fn.histget(kind, i) ~= "" then
+      if n == pos then return i end
+      n = n + 1
+    end
+  end
+end
+
+---@param kind ":"|"/"
 ---@param selected string[]
 ---@param opts fzf-lua.config.CommandHistory|{}
 local hist_del = function(kind, selected, opts)
   if not vim.iter then return end
-  local iter = opts.reverse_list and vim.iter(selected) or vim.iter(selected):rev()
-  iter:each(function(e)
-    local idx = assert(utils.tointeger(opts.reverse_list and e or -e - 1))
-    local entry = vim.fn.histget(":", idx) -- get before deleted
+  -- Resolve every picker position before deleting anything: deleting an entry
+  -- turns it into a hole and shifts the positions of the entries after it.
+  local indices = vim.tbl_map(function(e)
+    return assert(hist_index(kind, assert(utils.tointeger(e)), opts.reverse_list))
+  end, selected)
+  for _, idx in ipairs(indices) do
+    local entry = vim.fn.histget(kind, idx) -- get before deleted
     local res = vim.fn.histdel(kind, idx)
     local info = res == 1 and "deleted" or "fail to delete"
     local notify = res == 1 and utils.info or utils.warn
     notify("%s: %s", info, entry)
-  end)
+  end
   vim.cmd("wshada!")
 end
 
-M.ex_del = function(...)
-  hist_del(":", ...)
+---@param selected string[]
+---@param opts fzf-lua.config.CommandHistory|{}
+M.ex_del = function(selected, opts)
+  hist_del(":", selected, opts)
 end
 
-M.search_del = function(...)
-  hist_del("/", ...)
+---@param selected string[]
+---@param opts fzf-lua.config.SearchHistory|{}
+M.search_del = function(selected, opts)
+  hist_del("/", selected, opts)
 end
 
 M.goto_mark = function(selected)
@@ -631,8 +715,9 @@ M.goto_jump = function(selected, opts)
     if not ok then
       filepath = ""
     else
-      filepath = res
+      filepath = res --[[@as string]]
     end
+    ---@diagnostic disable-next-line: param-type-mismatch, missing-parameter
     if not filepath or not uv.fs_stat(filepath) then
       -- no accessible file
       -- jump is in current
@@ -655,6 +740,7 @@ for _, fname in ipairs({ "edit", "split", "vsplit", "tabedit" }) do
   ---@param opts fzf-lua.config.Resolved
   M["keymap_" .. fname] = function(selected, opts)
     if not selected[1] then return end
+    ---@diagnostic disable-next-line: redundant-parameter
     local entry = path.keymap_to_entry(selected[1], opts)
     if entry.path then
       M["file_" .. fname]({ entry.stripped }, opts)
@@ -753,9 +839,11 @@ local function helptags(s, opts)
     local entry = path.entry_to_file(x, opts)
     if entry and entry.path and package.loaded.lazy then
       -- make sure the plugin is loaded. This won't do anything if already loaded
+      ---@diagnostic disable-next-line: unresolved-require
       local lazyConfig = require("lazy.core.config")
       local _, plugin = path.normalize(entry.path):match("(/([^/]+)/doc/)")
       if plugin and lazyConfig.plugins[plugin] then
+        ---@diagnostic disable-next-line: unresolved-require
         require("lazy").load({ plugins = { plugin } })
       end
     end
@@ -872,6 +960,7 @@ M.git_branch_add = function(selected, opts)
   -- so the prompt input will be found in `selected[1]`
   -- previous fzf versions (or skim) restart the process instead
   -- so the prompt input will be found in `opts.last_query`
+  ---@diagnostic disable-next-line: undefined-field
   local branch = selected[1] or opts.last_query
   if type(branch) ~= "string" or #branch == 0 then
     utils.warn("Branch name cannot be empty, use prompt for input.")
@@ -1116,7 +1205,10 @@ M.git_buf_edit = function(selected, opts)
   local git_root = assert(path.git_root(opts, true), "not in git directory")
   local win = vim.api.nvim_get_current_win()
   local buffer_filetype = vim.bo.filetype
-  local file = path.relative_to(path.normalize(vim.fn.expand("%:p")), git_root)
+  -- `fn_match_file` lets a provider (e.g. bcommits `follow`) resolve the path the
+  -- buffer had at the selected commit; otherwise fall back to the current name.
+  local file = type(opts.fn_match_file) == "function" and opts.fn_match_file(selected[1], opts)
+      or path.relative_to(path.normalize(vim.fn.expand("%:p") --[[@as string]]), git_root)
   local commit_hash = match_commit_hash(selected[1], opts)
   table.insert(cmd, commit_hash .. ":" .. file)
   local git_file_contents = utils.io_systemlist(cmd)
@@ -1159,7 +1251,7 @@ M.grep_lgrep = function(_, opts)
     __resume_key = opts.__resume_key,
     rg_glob = opts.rg_glob or opts.__call_opts.rg_glob,
     -- globs always require command processing with 'multiprocess'
-    multiprocess = opts.multiprcess and (opts.rg_glob or opts.__call_opts.rg_glob) and 1,
+    multiprocess = opts.multiprocess and (opts.rg_glob or opts.__call_opts.rg_glob) and 1,
     -- when used with tags pass the resolved ctags_file from tags-option as
     -- `tagfiles()` might not return the correct file called from the float (#700)
     ctags_file = opts.ctags_file,
@@ -1176,13 +1268,14 @@ M.toggle_flag = function(_, opts)
   local o = vim.tbl_deep_extend("keep", {
     -- grep|live_grep sets `opts._cmd` to the original
     -- command without the search argument
+    ---@diagnostic disable-next-line: param-type-mismatch
     cmd = utils.toggle_cmd_flag(assert(opts._cmd or opts.cmd), assert(opts.toggle_flag)),
     resume = true
   }, opts.__call_opts or {})
   opts.__call_fn(o)
 end
 
----@param opts fzf-lua.config.Resolved|{}
+---@param opts fzf-lua.config.Resolved
 ---@param opt_name string
 M.toggle_opt = function(opts, opt_name)
   -- opts.__call_opts[opt_name] = not opts[opt_name]
@@ -1221,7 +1314,7 @@ end
 M.paste_register = function(selected)
   if not selected[1] then return end
   local reg = selected[1]:match("%[(.-)%]")
-  local data = vim.fn.getreg(reg)
+  local data = vim.fn.getreg(reg) --[[@as string]]
   if #data > 0 then vim.api.nvim_paste(data, false, -1) end
 end
 
@@ -1322,31 +1415,121 @@ end
 
 M.undo = function(selected, _opts)
   if not selected[1] then return end
-  local seq = selected[1]:match("%d+")
+  local seq = utils.strip_ansi_coloring(selected[1]):match("%d+")
+  if not seq then return end
   vim.cmd("silent undo " .. tostring(seq))
   utils.info("Undo jump to %s.", seq == "0" and "origin" or "change #" .. tostring(seq))
 end
 
-local parse_entry = function(e) return e and e:match("%((.-)%)") or nil end
+-- Serverlist actions (`<cwd> <mem> <cpu><nbsp><address>` entries).
+-- Action errors run over RPC where stderr is invisible, so every outcome
+-- below is reported with `utils.info|warn` instead of `assert`, and all RPC
+-- is timed so a hung server can't freeze the picker.
+local parse_entry = utils.serverlist_parse_entry
+
+-- A `qa!` sent over a timed RPC can time out when the target exits before
+-- the response arrives (the channel dies mid-request); poll the liveness
+-- probe briefly to distinguish that from a genuinely unserved request.
+-- Only channel-gone evidence counts as exit: "Invalid channel" (nothing
+-- listens at `addr`) or "closed by the peer" (the process died while the
+-- probe was in flight). A probe timeout only proves the peer is reachable
+-- but not answering, so it keeps polling (fast while the peer responds,
+-- one RPC timeout per stuck probe) until the bounded window is exhausted.
+---@param addr string
+---@return boolean exited
+local function server_exited(addr)
+  for _ = 1, 5 do
+    local alive, detail = utils.server_probe(addr)
+    if not alive and type(detail) == "string" and
+        (detail:match("Invalid channel")
+          or detail:match("ch %d+ was closed by the peer")) then
+      return true
+    end
+    vim.wait(100)
+  end
+  return false
+end
 
 M.serverlist_kill = function(sel)
-  vim.iter(sel):map(parse_entry):each(function(addr)
-    local ok, err = utils.rpcexec(addr, "nvim_exec2", "qa!", {})
-    assert(ok
-      or tostring(err):match("Invalid channel")
-      or tostring(err):match("ch %d+ was closed by the peer"),
-      err)
+  -- NOTE: do not `assert` here, action errors are executed over RPC and
+  -- surface nowhere visible; report outcomes explicitly instead. Timed RPC
+  -- so a hung server can't freeze the picker indefinitely.
+  if not sel or #sel == 0 then
+    -- Loud (not silent): distinguishes "key never delivered a selection"
+    -- from "selection didn't parse" (reported below as noaddr).
+    utils.warn("serverlist kill: no selection.")
+    return
+  end
+  local killed, gone, noaddr, failures = 0, 0, 0, {} ---@type integer, integer, integer, string[]
+  ---@diagnostic disable-next-line: redundant-parameter, call-non-callable
+  vim.iter(sel):each(function(entry)
+    -- parse inside `:each()`: `map()` drops nil results, which would hide
+    -- unparseable selections from the `noaddr` count below
+    local addr = parse_entry(entry)
+    if not addr then
+      noaddr = noaddr + 1
+      return
+    end
+    local ok, err = utils.rpcexec_timed(addr, "nvim_exec2", "qa!", {})
+    if ok or tostring(err):match("ch %d+ was closed by the peer") then
+      -- target quit; the channel closing under us is the expected outcome
+      killed = killed + 1
+    elseif tostring(err):match("Invalid channel") then
+      -- never reached: died between listing and kill (or bad address),
+      -- do NOT report as killed
+      gone = gone + 1
+    elseif tostring(err) == "Timeout" and server_exited(addr) then
+      -- `qa!` was delivered but the response was lost when the target exited
+      -- mid-request; the probe confirmed it is gone, count as killed (still
+      -- reachable -> falls through to the failure report below)
+      killed = killed + 1
+    else
+      failures[#failures + 1] = ("%s: %s"):format(
+        utils.escape_invisible(addr), tostring(err))
+    end
   end)
+  -- report every non-empty outcome independently so mixed results
+  -- (e.g. one killed, one failed) show both
+  if #failures > 0 then
+    utils.warn("serverlist kill failed: %s", table.concat(failures, "; "))
+  end
+  if killed > 0 then
+    utils.info("Killed %d server(s).", killed)
+  end
+  if gone > 0 then
+    utils.info("Server already exited.")
+  end
+  if noaddr > 0 then
+    utils.warn("serverlist kill: no server address in selection.")
+  end
 end
 
 M.serverlist_spawn = function()
-  libuv.uv_spawn(
-    vim.fn.exepath("nvim"), { args = { "--headless" }, env = { NVIM = "" }, detached = true })
+  libuv.uv_spawn(vim.fn.exepath("nvim"),
+    ---@diagnostic disable-next-line: missing-parameter, assign-type-mismatch
+    { args = { "--headless" }, env = { NVIM = "" }, detached = true })
 end
 
 M.serverlist_connect = function(sel)
+  if not sel then return end
   local addr = parse_entry(sel[1])
   if not addr then return end
+  local self_bs, self_fs = vim.v.servername or "", (vim.v.servername or ""):gsub("\\", "/")
+  if addr == self_bs or (utils.__IS_WINDOWS and addr == self_fs) then
+    -- connecting to self detaches the UI (same as `:detach`), never useful
+    utils.info("Already attached to %s.", addr)
+    return
+  end
+  -- Pre-flight: `:connect` abandons our current session, so never detach
+  -- into the void when the target died (or the address is stale).
+  local alive, detail = utils.server_probe(addr)
+  if not alive then
+    -- byte-escape invisible junk (\r, ANSI, ...) so a mangled address
+    -- can't hide behind an identical-looking message (pipes are clean)
+    utils.warn("serverlist connect: %s is unreachable (%s).",
+      utils.escape_invisible(addr), tostring(detail))
+    return
+  end
   vim.cmd.connect(addr)
 end
 

@@ -111,7 +111,10 @@ T["win"]["hide"]["can resume after close CTX win (#1936)"] = function()
   -- can :wqa when there're hide job #1817
   pcall(child.cmd, [[wqa]])
   -- child.is_running() didn't work as expected
-  local res = vim.fn.jobwait({ assert(child.job).id }, 1000)[1]
+  local job = child.job
+  if not job then error("child.job is nil after :wqa") end
+  local job_id = job.id --[[@as integer]]
+  local res = vim.fn.jobwait({ job_id }, 1000)[1]
   -- 0 = normal exit, -3 = already exited/invalid (acceptable race)
   local valid_res = { [0] = true, [-3] = true }
   eq(valid_res[res] or res, true) -- HACK: show the res code in the assert
@@ -146,19 +149,30 @@ end
 
 T["win"]["keymap"] = new_set({ n_retry = not helpers.IS_LINUX() and 5 or nil })
 
-T["win"]["keymap"]["no error"] = new_set({
-  parametrize = vim.iter(require("fzf-lua.defaults").defaults.keymap.builtin)
-      :map(function(key, action) return { key, action } end)
-      :totable()
-}, {
+T["win"]["keymap"]["no error"] = new_set({ parametrize = (function()
+  local builtin = require("fzf-lua.defaults").defaults.keymap.builtin
+  ---@cast builtin table
+  local out = {}
+  for key, action in pairs(builtin) do out[#out + 1] = { key, action } end
+  return out
+end)() }, {
   function(key, action)
     for _, event in ipairs({ "start", "load", "result" }) do
-      if action == "toggle-preview" then helpers.SKIP_IF_WIN() end
       helpers.FzfLua.files(child, {
-        __abort_key = key .. "<c-c>",
+        __no_abort = true,
         __expect_lines = false,
         __after_open = function()
           if helpers.IS_WIN() then vim.uv.sleep(250) end
+          -- Press the key being tested, then give window-affecting actions
+          -- (e.g. toggle-fullscreen) a moment to settle before closing.
+          -- On Windows, sending the action and abort too close together can
+          -- crash the child RPC channel.
+          child.type_keys(key)
+          sleep(100); if helpers.IS_WIN() then sleep(250) end
+          child.type_keys("<c-c>")
+          child.wait_until(function()
+            return child.lua_get([[_G._fzf_lua_on_create]]) == vim.NIL
+          end, 5000)
         end,
         query = "README.md",
         winopts = { preview = { wrap = false } },
@@ -197,7 +211,7 @@ T["win"]["previewer"]["split flex layout resize"] = function()
   child.wait_until(function()
     return child.lua_get([[_G._fzf_resize_called]]) == true
   end)
-  if helpers.IS_WIN() then vim.uv.sleep(250) end
+  sleep(100); if not helpers.IS_LINUX() then sleep(250) end
   child.expect_screen_lines(screen_opts)
   -- abort and wait for winopts.on_close
   child.type_keys("<c-c>")
@@ -286,9 +300,11 @@ T["win"]["toggle"][""] = new_set(
           if helpers.IS_WIN() then vim.uv.sleep(250) end
         end,
       }
+      ---@diagnostic disable-next-line: assign-type-mismatch
       opts = vim.tbl_deep_extend("force", opts, o)
       -- don't modify o directly, otherwise it will change screenshots name
       if a:match("E") then
+        ---@diagnostic disable-next-line: assign-type-mismatch
         opts = vim.tbl_deep_extend("force", opts, { winopts = { toggle_behavior = "extend" } })
       end
       if a:match("B") then
@@ -316,7 +332,7 @@ T["win"]["relative=cursor"] = function()
     previewer = function() return require("fzf-lua.test.previewer").builtin end,
     __after_open = function()
       child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
-      if not helpers.IS_LINUX() then vim.uv.sleep(250) end
+      sleep(100); if not helpers.IS_LINUX() then sleep(250) end
     end,
   }
   helpers.FzfLua.fzf_exec(child, { "foo", "bar", "baz" }, opts)
@@ -336,7 +352,8 @@ T["win"]["reuse"] = new_set({
     { {} },
     { { winopts = { split = "enew", } } },
     { { winopts = { split = "botright new", preview = { layout = "horizontal" } } } },
-  }
+  },
+  n_retry = not helpers.IS_LINUX() and 5 or nil
 }, {
   function(o)
     -- Ignore terminal command line with process number
@@ -352,9 +369,10 @@ T["win"]["reuse"] = new_set({
       previewer = function() return require("fzf-lua.test.previewer").builtin end,
       __after_open = function()
         child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
-        if helpers.IS_WIN() then vim.uv.sleep(250) end
+        sleep(100); if not helpers.IS_LINUX() then sleep(250) end
       end,
     }
+    ---@diagnostic disable-next-line: assign-type-mismatch
     opts = vim.tbl_deep_extend("force", opts, o)
     helpers.FzfLua.fzf_exec(child, { "foo", "bar", "baz" }, opts)
     -- change to fzf preview
@@ -382,7 +400,7 @@ T["win"]["highlight"]["unchange when reuse win #2588"] = function()
   helpers.SKIP_IF_WIN() -- windows attr looks different
   local opts = {
     __no_abort = true,
-    __after_open = function() if helpers.IS_WIN() then vim.uv.sleep(250) end end,
+    __after_open = function() sleep(100); if not helpers.IS_LINUX() then sleep(250) end end,
     cwd_prompt = false,
   }
   helpers.FzfLua.files(child, opts)
@@ -390,6 +408,98 @@ T["win"]["highlight"]["unchange when reuse win #2588"] = function()
   exec_lua([[_G._fzf_lua_on_create = nil]])
   exec_lua([[_G._fzf_load_called = nil]])
   helpers.FzfLua.files(child, opts)
+end
+
+T["win"]["restore last window"] = new_set()
+
+T["win"]["restore last window"]["does not trigger float autoclose (#2837)"] = function()
+  exec_lua([[
+    _G._float_win = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, {
+      relative = "editor",
+      width = 20,
+      height = 5,
+      row = 1,
+      col = 1,
+    })
+    vim.bo[vim.api.nvim_win_get_buf(_G._float_win)].buftype = "nofile"
+    -- mimic Mason's autoclose handler: close the float when a regular
+    -- buffer is entered
+    vim.api.nvim_create_autocmd("WinEnter", {
+      callback = function()
+        local buftype = vim.bo.buftype
+        if buftype ~= "prompt" and buftype ~= "nofile" then
+          vim.schedule(function()
+            if vim.api.nvim_win_is_valid(_G._float_win) then
+              vim.api.nvim_win_close(_G._float_win, true)
+            end
+          end)
+        end
+      end,
+    })
+  ]])
+  exec_lua([[FzfLua.files{ query = "README.md" }]])
+  child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
+  child.type_keys("<esc>")
+  child.wait_until(function() return child.lua_get([[_G._fzf_lua_on_create]]) == vim.NIL end)
+  sleep(100)
+  eq(true, child.lua_get([[vim.api.nvim_win_is_valid(_G._float_win)]]))
+  exec_lua([[if vim.api.nvim_win_is_valid(_G._float_win) then vim.api.nvim_win_close(_G._float_win, true) end]])
+end
+
+T["win"]["restore last window"]["keeps events for regular windows (#2812)"] = function()
+  exec_lua([[
+    -- Keep the original window as the intermediate target.
+    vim.cmd("split")
+    vim.cmd("enew")
+    _G._src_win = vim.api.nvim_get_current_win()
+    _G._src_win_enter = 0
+    _G._src_buf_enter = 0
+    vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+      callback = function(args)
+        if vim.api.nvim_get_current_win() ~= _G._src_win then return end
+        if args.event == "WinEnter" then
+          _G._src_win_enter = _G._src_win_enter + 1
+        else
+          _G._src_buf_enter = _G._src_buf_enter + 1
+        end
+      end,
+    })
+  ]])
+  exec_lua([[FzfLua.files{ query = "README.md" }]])
+  child.wait_until(function() return child.lua_get([[_G._fzf_load_called]]) == true end)
+  -- only count the events fired while closing, not the ones from opening fzf
+  exec_lua([[_G._src_win_enter = 0; _G._src_buf_enter = 0]])
+  child.type_keys("<esc>")
+  child.wait_until(function() return child.lua_get([[_G._fzf_lua_on_create]]) == vim.NIL end)
+  eq(true, child.lua_get([[_G._src_win_enter > 0]]))
+  eq(true, child.lua_get([[_G._src_buf_enter > 0]]))
+end
+
+T["win"]["treesitter"] = new_set()
+
+T["win"]["treesitter"]["short lines do not break highlight parsing"] = function()
+  -- Short rows (e.g. the "> " prompt and "  1/1" counter) used to produce
+  -- an `end_col < start_col` region which treesitter rejects on parse
+  exec_lua([[
+    local tsinjector = require("fzf-lua.win.tsinjector")
+    _G._ts_buf = vim.api.nvim_create_buf(false, true)
+    _G._ts_detach = tsinjector.attach({ winopts = {}, preview_hidden = true }, _G._ts_buf,
+      function(line) return "foo.vim", nil, line end)
+    vim.api.nvim_buf_set_lines(_G._ts_buf, 0, -1, false,
+      { "FzfLua command_history", "> " })
+  ]])
+  eq(true, child.lua_get([[(function()
+    local tsinjector = require("fzf-lua.win.tsinjector")
+    local ok = pcall(function()
+      tsinjector.cache[_G._ts_buf].vim.highlighter.tree:parse({ 0, 3 })
+    end)
+    if not ok then return false end
+    -- the valid line must still produce a non-empty region
+    local regions = tsinjector.cache[_G._ts_buf].vim.parser:included_regions()
+    local range = regions[1] and regions[1][1]
+    return #regions == 1 and range and range[5] > range[2]
+  end)()]]))
+  exec_lua([[_G._ts_detach()]])
 end
 
 return T

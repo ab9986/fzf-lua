@@ -467,6 +467,31 @@ describe("Testing path module", function()
       eq(path.entry_to_file("file:///tmp/test.txt:5:6", {}, true), r)
     end)
 
+    -- #2786: stripping ANSI coloring must not corrupt UTF-8 multibyte chars
+    it("strip_ansi_coloring preserves UTF-8 #2786", function()
+      -- plain ANSI SGR sequences still stripped
+      eq(utils.strip_ansi_coloring("\27[34mfoo\27[0m"), "foo")
+      eq(utils.strip_ansi_coloring("\27[1;34mfoo\27[0m"), "foo")
+      eq(utils.strip_ansi_coloring("\27[mfoo\27[0m"), "foo")
+      -- UTF-8 Polish "ści" (\xC5\x9B\x63\x69) must not have its second
+      -- byte (\x9B) eaten together with the trailing ASCII letter "c"
+      -- by an over-permissive regex
+      local sci = "\197\155" .. "ci.txt"
+      eq(utils.strip_ansi_coloring(sci), sci)
+      -- same but wrapped in SGR escape sequences (typical fzf output)
+      eq(utils.strip_ansi_coloring("\27[0m" .. sci .. "\27[0m"), sci)
+      -- other multibyte characters whose second byte overlaps the
+      -- "final byte" character class of the broken regex
+      eq(utils.strip_ansi_coloring("\195\177"), "\195\177")  -- "ñ"
+      eq(utils.strip_ansi_coloring("\195\184"), "\195\184")  -- "ø"
+      eq(utils.strip_ansi_coloring("\209\134" .. "x.txt"), "\209\134" .. "x.txt") -- "цx.txt"
+      -- entry_to_file must return the path with UTF-8 bytes intact
+      local p = "/tmp/" .. sci
+      eq(path.entry_to_file(p), { stripped = p, path = p, line = 0, col = 0 })
+      local e = "\27[0m" .. p .. "\27[0m:42"
+      eq(path.entry_to_file(e), { stripped = p .. ":42", path = p, line = 42, col = 0 })
+    end)
+
     it("parse loaded path", function()
       helpers.SKIP_IF_WIN()
       local win = vim.api.nvim_get_current_win()
@@ -669,37 +694,37 @@ describe("Testing path module", function()
     end)
 
     it("sets winopts.title to 'VCS Files (jj)' in a jj repo", function()
-      local received_opts
+      local received_opts ---@cast received_opts table
       path.is_jj_repo = function() return true end
       path.is_git_repo = function() return false end
-      jj_provider.files = function(opts) received_opts = opts end
+      jj_provider.files = (function(opts) received_opts = opts end --[[@as any]])
       files_provider.vcs_files({})
       eq(received_opts.winopts.title, " VCS Files (jj) ")
     end)
 
     it("sets winopts.title to 'VCS Files (git)' in a git repo", function()
-      local received_opts
+      local received_opts ---@cast received_opts table
       path.is_jj_repo = function() return false end
       path.is_git_repo = function() return true end
-      git_provider.files = function(opts) received_opts = opts end
+      git_provider.files = (function(opts) received_opts = opts end --[[@as any]])
       files_provider.vcs_files({})
       eq(received_opts.winopts.title, " VCS Files (git) ")
     end)
 
     it("does not set winopts.title when falling back to files", function()
-      local received_opts
+      local received_opts ---@cast received_opts table
       path.is_jj_repo = function() return false end
       path.is_git_repo = function() return false end
-      files_provider.files = function(opts) received_opts = opts end
+      files_provider.files = (function(opts) received_opts = opts end --[[@as any]])
       files_provider.vcs_files({})
       eq(received_opts.winopts, nil)
     end)
 
     it("does not override user-supplied winopts.title", function()
-      local received_opts
+      local received_opts ---@cast received_opts table
       path.is_jj_repo = function() return true end
       path.is_git_repo = function() return false end
-      jj_provider.files = function(opts) received_opts = opts end
+      jj_provider.files = (function(opts) received_opts = opts end --[[@as any]])
       files_provider.vcs_files({ winopts = { title = " My Title " } })
       eq(received_opts.winopts.title, " My Title ")
     end)
@@ -717,7 +742,7 @@ describe("Testing path module", function()
       local orig_info = utils.info
       utils.info = function(msg) info_msg = msg end
       -- path.git_root calls utils.info when noerr is falsy
-      path.git_root = function(opts, noerr)
+      path.git_root = function(_opts, noerr)
         if not noerr then
           utils.info("not a git repository")
         end
