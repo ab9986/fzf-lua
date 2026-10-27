@@ -187,7 +187,7 @@ end
 
 local libuv = require("fzf-lua.libuv")
 local function full_path(path)
-  return (vim.fn.fnamemodify(path:gsub("^%a:", string.upper), ":p"):gsub("(.)/$", "%1"))
+  return (vim.fn.fnamemodify((path:gsub("^%a:", string.upper)), ":p"):gsub("(.)/$", "%1"))
 end
 
 M.cwd_only = function(text, current_cwd, opts)
