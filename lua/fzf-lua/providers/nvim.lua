@@ -185,18 +185,44 @@ M.jumps = function(opts)
   return M.changes_or_jumps(opts)
 end
 
+local libuv = require("fzf-lua.libuv")
+local function full_path(path)
+  return (vim.fn.fnamemodify(path:gsub("^%a:", string.upper), ":p"):gsub("(.)/$", "%1"))
+end
+
+M.cwd_only = function(text, current_cwd, opts)
+  if not opts.cwd_only then
+    return true
+  end
+  if text then
+    local ok, res = pcall(libuv.expand, text)
+    if ok then
+      if vim.startswith(full_path(res), current_cwd) then
+        return true
+      end
+    else
+      if not uv.fs_stat(text) then
+        return true
+      end
+    end
+  end
+  return false
+end
 M.changes_or_jumps = function(opts)
   local jumps = vim.split(vim.fn.execute(opts.cmd), "\n")
-
+  local current_cwd = full_path(vim.fn.getcwd())
   local entries = {}
   for i = #jumps - 1, 3, -1 do
     local entry = jumps[i] ---@cast entry -?
+
     local jump, line, col, text = entry:match("(%d+)%s+(%d+)%s+(%d+)%s+(.*)")
-    table.insert(entries, string.format(" %16s %15s %15s %s",
-      utils.ansi_codes.yellow(jump),
-      utils.ansi_codes.blue(line),
-      utils.ansi_codes.green(col),
-      text))
+    if M.cwd_only(text, current_cwd, opts) then
+      table.insert(entries, string.format(" %16s %15s %15s %s",
+        utils.ansi_codes.yellow(jump),
+        utils.ansi_codes.blue(line),
+        utils.ansi_codes.green(col),
+        text))
+    end
   end
 
   if utils.tbl_isempty(entries) then
