@@ -197,10 +197,12 @@ M.cwd_only = function(text, current_cwd, opts)
   if text then
     local ok, res = pcall(libuv.expand, text)
     if ok then
+      -- print("res:" .. full_path(res)) 
       if vim.startswith(full_path(res), current_cwd) then
         return true
       end
     else
+      -- print("text:" .. text)
       if not uv.fs_stat(text) then
         return true
       end
@@ -211,8 +213,9 @@ end
 M.changes_or_jumps = function(opts)
   local jumps = vim.split(vim.fn.execute(opts.cmd), "\n")
   local current_cwd = full_path(vim.fn.getcwd())
+  -- print("cwd:" .. current_cwd)
   local entries = {}
-  for i = #jumps - 1, 3, -1 do
+  for i = #jumps - 1, 2, -1 do
     local entry = jumps[i] ---@cast entry -?
 
     local jump, line, col, text = entry:match("(%d+)%s+(%d+)%s+(%d+)%s+(.*)")
