@@ -83,8 +83,8 @@ M.expect = function(actions, opts)
           prefix_bind,
           recorder
         ))
-      elseif utils.has(opts, "sk", { 0, 14 }) then
-        -- sk 0.14 deprecated `--expect`, instead `accept(<key>)` should be used
+      elseif utils.has(opts, "sk") then
+        -- skim deprecated `--expect`, instead `accept(<key>)` should be used
         -- skim does not yet support case sensitive alt-shift binds, they are ignored
         -- if k:match("^alt%-%u") then return end
         if type(v.prefix) == "string" and not v.prefix:match("%+$") then
@@ -115,7 +115,7 @@ M.normalize_selected = function(selected, opts)
   local actions = assert(opts.actions)
   -- Backward compat, "default" action trumps "enter"
   if actions.default then actions.enter = actions.default end
-  if utils.has(opts, "fzf", { 0, 53 }) or utils.has(opts, "sk", { 0, 14 }) then
+  if utils.has(opts, "fzf", { 0, 53 }) or utils.has(opts, "sk") then
     -- Using the new `print` action keybind is expected at `selected[1]`
     -- NOTE: if `--select-1|-q` was used we'll be missing the keybind
     -- since `-1` triggers "accept" assume "enter" (#1589)
@@ -663,6 +663,34 @@ end
 ---@param opts fzf-lua.config.SearchHistory|{}
 M.search_del = function(selected, opts)
   hist_del("/", selected, opts)
+end
+
+--- Clear the register selected in the registers picker.
+---@param selected string[]
+M.reg_clear = function(selected)
+  if not selected[1] then return end
+
+  local reg_name = string.match(selected[1], "^%[([^]][^]]?)%].*")
+  if not reg_name then return end
+
+  if reg_name == '"' then
+    -- setreg('"') always writes to register 0, resolve the register the
+    -- unnamed register currently points to so we clear the displayed value.
+    local reg_info = vim.fn.getreginfo('"')
+    local points_to = reg_info.points_to
+    if not points_to or points_to == "" then return end
+    reg_name = points_to
+  end
+
+  if reg_name == "%" or reg_name == ":" or reg_name == "." then
+    utils.info("Register `%s` is read-only.\n", reg_name)
+    return
+  end
+
+  local ok, err = pcall(vim.fn.setreg, string.lower(reg_name), "")
+  if not ok then
+    utils.warn("Failed to clear register `%s`: %s", reg_name, err)
+  end
 end
 
 M.goto_mark = function(selected)

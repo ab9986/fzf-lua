@@ -10,6 +10,11 @@ local utils = fzf.utils
 local actions = require("fzf-lua.actions")
 local providers = require("fzf-lua.providers.nvim")
 
+-- Use the real platform for spawning siblings: other specs temporarily
+-- spoof `utils.__IS_WINDOWS`, and a leaked value must not select a unix
+-- socket path on Windows (the listen address is platform-specific).
+local IS_WINDOWS = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+
 -- Flat, fail-fast bounds (no scaling multiplier): every wait below is
 -- strictly bounded so a slow/broken environment fails loudly instead of
 -- burning the CI job timeout with cascaded long polls. Spawning a stock
@@ -28,7 +33,7 @@ local function spawn_sibling(extra, name)
   if not addr then
     -- NOTE: names must match the discovery scan (`nvim*`) yet must NOT
     -- contain `fzf-lua` (own-infra filter) or `nvim-term-` (pty filter)
-    if utils.__IS_WINDOWS then
+    if IS_WINDOWS then
       addr = ([[\\.\pipe\nvim-srv-test-%d-%d]]):format(vim.fn.getpid(), sibling_seq)
     else
       -- on unix only `nvim*` listeners under the run dir are discovered
@@ -52,7 +57,7 @@ local function spawn_sibling(extra, name)
   end, 30000) then
     -- don't leak the dud: reap it before failing loudly
     pcall(vim.fn.jobstop, jobid)
-    if not utils.__IS_WINDOWS then pcall(vim.fn.delete, addr) end
+    if not IS_WINDOWS then pcall(vim.fn.delete, addr) end
     error("sibling never became responsive: " .. addr)
   end
   return jobid, addr
@@ -65,7 +70,7 @@ local function quit_sibling(jobid, addr)
     local ok = utils.rpcexec_timed(addr, "nvim_get_chan_info", 0)
     return not ok
   end, 15000)
-  if not utils.__IS_WINDOWS then pcall(vim.fn.delete, addr) end
+  if not IS_WINDOWS then pcall(vim.fn.delete, addr) end
 end
 
 -- run fn with a disposable sibling, guaranteeing cleanup (quit+reap)
@@ -94,6 +99,123 @@ end
 local function serverlist_entry(addr)
   return ("somecwd 1K 0.0%%%s%s"):format(utils.nbsp, utils.ansi_codes.grey(addr))
 end
+
+describe("serverlist format_entry", function()
+  local format_entry = providers._format_serverlist_entry
+  local now = 1700000000
+  local orig_time
+
+  before_each(function()
+    orig_time = os.time
+    os.time = function() return now end
+  end)
+
+  after_each(function()
+    os.time = orig_time
+  end)
+
+  it("omits activity without v:useractive", function()
+    local line = format_entry({
+      cwd = "/tmp",
+      rusage = { maxrss = 1 },
+      cpu_pct = 0,
+      socket = "/tmp/nvim.1.0",
+    }, 4)
+    eq(utils.strip_ansi_coloring(line):find("ago", 1, true), nil)
+    eq(utils.strip_ansi_coloring(line):find("just now", 1, true), nil)
+    eq(utils.serverlist_parse_entry(line), "/tmp/nvim.1.0")
+  end)
+
+  it("omits activity when v:useractive is zero", function()
+    local line = format_entry({
+      cwd = "/tmp",
+      rusage = { maxrss = 1 },
+      cpu_pct = 0,
+      socket = "/tmp/nvim.1.0",
+      useractive = 0,
+    }, 4)
+    eq(utils.strip_ansi_coloring(line):find("ago", 1, true), nil)
+    eq(utils.strip_ansi_coloring(line):find("just now", 1, true), nil)
+  end)
+
+  it("formats v:useractive as a green relative time", function()
+    local line = format_entry({
+      cwd = "/tmp",
+      rusage = { maxrss = 1 },
+      cpu_pct = 0,
+      socket = "/tmp/nvim.1.0",
+      useractive = (now - 7200) * 1e9,
+    }, 4)
+    eq(line:find(utils.ansi_codes.green("2 hours ago"), 1, true) ~= nil, true)
+    eq(utils.serverlist_parse_entry(line), "/tmp/nvim.1.0")
+  end)
+end)
+
+describe("serverlist useractive", function()
+  it("formats v:useractive when available", function()
+    -- platform spoofing left behind by earlier specs must not leak here
+    eq(utils.__IS_WINDOWS, IS_WINDOWS)
+    with_sibling(nil, nil, function(_, addr)
+      ---@diagnostic disable-next-line: undefined-field
+      local has_useractive = vim.v.useractive ~= nil
+      if has_useractive then
+        -- any UI input advances v:useractive in the peer
+        eq(utils.rpcexec_timed(addr, "nvim_input", "<Ignore>"), true)
+        assert(wait_until(function()
+          local ok, active = utils.rpcexec_timed(addr, "nvim_exec_lua",
+            "return vim.v.useractive", {})
+          return ok and type(active) == "number" and active > 0
+        end, 5000), "peer useractive did not advance")
+      end
+
+      -- wait until the same discovery the provider uses sees the peer;
+      -- nightly reports Windows pipes slash-normalized (`//./pipe/...`)
+      assert(wait_until(function()
+        local found = false
+        providers._discover_servers():each(function(p)
+          if list_has_addr({ p }, addr) then found = true end
+        end)
+        return found
+      end, 20000), "sibling missing from discovery")
+
+      local core = require("fzf-lua.core")
+      local orig_fzf_exec = core.fzf_exec
+      local contents
+      core.fzf_exec = function(f) contents = f end
+      local ok, err = pcall(providers.serverlist, {})
+      core.fzf_exec = orig_fzf_exec
+      if not ok then error(err) end
+      assert(type(contents) == "function", "serverlist did not call fzf_exec")
+
+      local entries, done = {}, false
+      contents(function(item)
+        if item then
+          entries[#entries + 1] = item
+        else
+          done = true
+        end
+      end)
+      assert(wait_until(function() return done end, 30000), "serverlist content did not finish")
+
+      local entry
+      for _, line in ipairs(entries) do
+        local parsed = utils.serverlist_parse_entry(line)
+        if parsed and list_has_addr({ parsed }, addr) then
+          entry = line
+          break
+        end
+      end
+      if not entry then error("sibling missing from serverlist entries") end
+      if has_useractive then
+        eq(entry:find(utils.ansi_codes.green("just now"), 1, true) ~= nil, true)
+      else
+        local plain = utils.strip_ansi_coloring(entry)
+        eq(plain:find("just now", 1, true), nil)
+        eq(plain:find("ago", 1, true), nil)
+      end
+    end)
+  end)
+end)
 
 describe("serverlist parse_entry", function()
   local orig_is_windows = utils.__IS_WINDOWS
